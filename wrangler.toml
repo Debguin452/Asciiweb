@@ -1,0 +1,7 @@
+name = "asciiweb"
+compatibility_date = "2024-09-23"
+pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "ROOMS_KV"
+id = "32d79302371b41ab8da1cc28acf6300a"

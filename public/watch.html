@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ATV Watch</title>
+  <meta name="description" content="Text-native video powered by the ATV codec" />
+  <meta property="og:type" content="video.other" />
+  <meta property="og:title" content="ATV Video" />
+  <meta property="og:description" content="Text-native video powered by the ATV codec — asciiweb" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "VideoObject",
+    "name": "ATV Video",
+    "description": "Text-native video powered by the ATV codec",
+    "encodingFormat": "application/octet-stream"
+  }
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #060606; color: #39ff14; font-family: "JetBrains Mono", monospace; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; gap: 1rem; padding: 1rem; }
+    #status { font-size: 0.8rem; opacity: 0.6; }
+    #player-wrap { width: min(900px, 100%); display: flex; flex-direction: column; gap: 0.5rem; }
+    canvas { display: block; max-width: 100%; image-rendering: pixelated; border: 1px solid rgba(57,255,20,0.15); }
+    .controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; padding: 0.4rem 0; }
+    button {
+      background: transparent; color: #39ff14; border: 1px solid rgba(57,255,20,0.4);
+      border-radius: 2px; font-family: inherit; font-size: 0.78rem; padding: 0.25rem 0.6rem;
+      cursor: pointer; opacity: 0.75;
+    }
+    button:hover { opacity: 1; }
+    .play-btn { min-width: 36px; }
+    input[type="range"] {
+      flex: 1; -webkit-appearance: none; appearance: none; height: 3px;
+      background: rgba(57,255,20,0.2); border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 10px; height: 10px;
+      border-radius: 50%; background: #39ff14; cursor: pointer;
+    }
+    select {
+      background: #060606; color: #39ff14; border: 1px solid rgba(57,255,20,0.4);
+      border-radius: 2px; font-family: inherit; font-size: 0.75rem; padding: 0.2rem 0.4rem;
+      cursor: pointer;
+    }
+    .meta { font-size: 0.65rem; opacity: 0.4; }
+    a { color: #39ff14; opacity: 0.5; font-size: 0.65rem; text-decoration: none; }
+    a:hover { opacity: 1; }
+  </style>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="player-wrap" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem">
+      <span id="title" class="meta"></span>
+      <a href="/">asciiweb</a>
+    </div>
+    <canvas id="c"></canvas>
+    <div class="controls">
+      <span id="ct" class="meta" style="min-width:36px">0.0s</span>
+      <input type="range" id="seek" min="0" value="0" />
+      <span id="dur" class="meta" style="min-width:36px">0.0s</span>
+      <button class="play-btn" id="playbtn">▶</button>
+      <select id="speed">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.5">1.5×</option>
+        <option value="2">2×</option>
+      </select>
+      <button id="dlbtn">⬇ .atv</button>
+      <span id="stats" class="meta"></span>
+    </div>
+  </div>
+  <div id="status">Loading ATV stream…</div>
+
+  <script type="module">
+    const ATV_MAGIC = "ATV1";
+
+    async function gunzip(data) {
+      const ds = new DecompressionStream("gzip");
+      const stream = new Blob([data]).stream().pipeThrough(ds);
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    function readU32(d, p) { return [((d[p]<<24)|(d[p+1]<<16)|(d[p+2]<<8)|d[p+3])>>>0, p+4]; }
+    function readU16(d, p) { return [(d[p]<<8)|d[p+1], p+2]; }
+    function readStr(d, p) { const [l,p2]=readU16(d,p); return [new TextDecoder().decode(d.slice(p2,p2+l)),p2+l]; }
+
+    function deserPalette(d, off) {
+      const [cnt,p] = readU16(d,off);
+      const pal = [];
+      for (let i=0;i<cnt;i++) pal.push({r:d[p+i*3],g:d[p+i*3+1],b:d[p+i*3+2],id:i});
+      return {palette:pal, bytesRead:2+cnt*3};
+    }
+
+    function deserHuff(d, off) {
+      const [cnt,p0] = readU16(d,off); let p=p0;
+      const table = new Map();
+      for (let i=0;i<cnt;i++) {
+        const [v,p2]=readU16(d,p); p=p2;
+        const len=d[p++];
+        const bits=(d[p]<<24)|(d[p+1]<<16)|(d[p+2]<<8)|d[p+3]; p+=4;
+        table.set(v,{bits,len});
+      }
+      const decode=new Map();
+      for (const [v,{bits,len}] of table) decode.set(bits.toString(2).padStart(len,'0'),v);
+      return {table,decode,bytesRead:p-off};
+    }
+
+    class BitReader {
+      constructor(d){this.d=d;this.pos=0;this.bp=0;this.cur=d[0]??0;}
+      readBit(){const b=(this.cur>>(7-this.bp))&1;this.bp++;if(this.bp===8){this.pos++;this.bp=0;this.cur=this.d[this.pos]??0;}return b;}
+      readBits(n){let r=0;for(let i=0;i<n;i++)r=(r<<1)|this.readBit();return r;}
+      get done(){return this.pos>=this.d.length;}
+    }
+
+    function huffDecode(data, decode, count) {
+      const br=new BitReader(data), out=[];
+      let code='';
+      while(out.length<count&&!br.done){
+        code+=br.readBit();
+        const v=decode.get(code);
+        if(v!==undefined){out.push(v);code='';}
+        if(code.length>24){code='';out.push(0);}
+      }
+      return out;
+    }
+
+    function rleDecode(flat) {
+      const out=[];
+      for(let i=0;i<flat.length-1;i+=2) for(let j=0;j<(flat[i+1]||1);j++) out.push(flat[i]);
+      return out;
+    }
+
+    function decodeKey(raw,offset,rows,cols,gDec,cDec,color) {
+      let p=offset+1;
+      const [rleCount,p2]=readU32(raw,p); p=p2;
+      const [gLen,p3]=readU32(raw,p); p=p3;
+      const gFlat=huffDecode(raw.slice(p,p+gLen),gDec,rleCount*2); p+=gLen;
+      const runs=[];
+      for(let i=0;i<gFlat.length-1;i+=2) runs.push({value:gFlat[i],count:gFlat[i+1]||1});
+      const gVals=rleDecode(runs.flatMap(r=>[r.value,r.count]));
+      let cVals=[];
+      if(color){const [cLen,p4]=readU32(raw,p);p=p4;cVals=huffDecode(raw.slice(p,p+cLen),cDec,rows*cols);p+=cLen;}
+      const tokens=[];
+      for(let y=0;y<rows;y++){const row=[];for(let x=0;x<cols;x++){const i=y*cols+x;row.push({g:gVals[i]??0,c:cVals[i]??0});}tokens.push(row);}
+      return{tokens,p};
+    }
+
+    function decodeDelta(raw,offset,gDec,cDec,color) {
+      let p=offset+1;
+      const [mbc,p2]=readU16(raw,p);p=p2;
+      const mbs=[];
+      for(let i=0;i<mbc;i++){const [bx,p3]=readU16(raw,p);p=p3;const [by,p4]=readU16(raw,p);p=p4;mbs.push({bx,by,dx:raw[p++]-128,dy:raw[p++]-128});}
+      const [dc,p5]=readU32(raw,p);p=p5;
+      const [gl,p6]=readU32(raw,p);p=p6;
+      const dg=huffDecode(raw.slice(p,p+gl),gDec,dc);p+=gl;
+      let dc2=[];
+      if(color){const [cl,p7]=readU32(raw,p);p=p7;dc2=huffDecode(raw.slice(p,p+cl),cDec,dc);p+=cl;}
+      const idxs=[];
+      for(let i=0;i<dc;i++){const [idx,p8]=readU32(raw,p);p=p8;idxs.push(idx);}
+      return{mbs,deltas:idxs.map((ci,i)=>({ci,g:dg[i]??0,c:dc2[i]??0})),p};
+    }
+
+    function applyMotion(prev,mbs,rows,cols) {
+      const out=prev.map(r=>[...r].map(t=>({...t})));
+      for(const mb of mbs){
+        for(let py=0;py<4;py++)for(let px=0;px<4;px++){
+          const dy=mb.by*4+py,dx=mb.bx*4+px;
+          if(dy>=rows||dx>=cols)continue;
+          const sy=Math.max(0,Math.min(rows-1,mb.by*4+mb.dy+py));
+          const sx=Math.max(0,Math.min(cols-1,mb.bx*4+mb.dx+px));
+          const src=prev[sy]?.[sx];if(src)out[dy][dx]={...src};
+        }
+      }
+      return out;
+    }
+
+    function applyDelta(base,deltas,rows,cols) {
+      const out=base.map(r=>[...r].map(t=>({...t})));
+      for(const d of deltas){const y=Math.floor(d.ci/cols),x=d.ci%cols;if(y<rows&&x<cols)out[y][x]={g:d.g,c:d.c};}
+      return out;
+    }
+
+    const id = location.pathname.split('/').pop();
+    const status = document.getElementById('status');
+    const wrap = document.getElementById('player-wrap');
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const playbtn = document.getElementById('playbtn');
+    const seekEl = document.getElementById('seek');
+    const ctEl = document.getElementById('ct');
+    const durEl = document.getElementById('dur');
+    const statsEl = document.getElementById('stats');
+    const titleEl = document.getElementById('title');
+    const dlbtn = document.getElementById('dlbtn');
+    const speedSel = document.getElementById('speed');
+
+    let decoder=null, frames=[], rawData=null;
+    let playing=false, fi=0, lastTime=0, speed=1;
+    const CW=7, CH=13;
+
+    async function load() {
+      const metaRes = await fetch(`/api/meta/${id}`);
+      if (!metaRes.ok) { status.textContent='Video not found'; return; }
+      const meta = await metaRes.json();
+      titleEl.textContent = `${meta.name} · ${meta.cols}×${meta.rows} · ${meta.frameCount}f · ${(meta.size/1024).toFixed(1)}KB`;
+      document.title = meta.name + ' — ATV';
+
+      const res = await fetch(`/api/stream/${id}`);
+      if (!res.ok) { status.textContent='Stream not available'; return; }
+      const buf = new Uint8Array(await res.arrayBuffer());
+      rawData = buf;
+
+      const raw = await gunzip(buf);
+      const magic = String.fromCharCode(raw[0],raw[1],raw[2],raw[3]);
+      if (magic !== ATV_MAGIC) { status.textContent='Invalid ATV file'; return; }
+
+      let p=4;
+      const ver=raw[p++];
+      const [cols,p2]=readU16(raw,p);p=p2;
+      const [rows,p3]=readU16(raw,p);p=p3;
+      const fps=raw[p++];
+      const colorMode=raw[p++]===1;
+      const [frameCount,p4]=readU32(raw,p);p=p4;
+      const [glyphSet,p5]=readStr(raw,p);p=p5;
+
+      const {palette,bytesRead:pb}=deserPalette(raw,p);p+=pb;
+      const {decode:gDec,bytesRead:gb}=deserHuff(raw,p);p+=gb;
+      const {decode:cDec,bytesRead:cb}=deserHuff(raw,p);p+=cb;
+
+      const glyphs=buildGlyphsSimple(glyphSet);
+
+      seekEl.max=frameCount-1;
+      durEl.textContent=(frameCount/fps).toFixed(1)+'s';
+      statsEl.textContent=`${cols}×${rows} · ${fps}fps · ${(buf.length/1024).toFixed(0)}KB`;
+
+      frames=new Array(frameCount).fill(null);
+      let scanP=p;
+      const offsets=[];
+      for(let i=0;i<frameCount;i++){
+        offsets.push(scanP);
+        const ft=raw[scanP];
+        if(ft===0x4b){
+          const [rc,sp]=readU32(raw,scanP+1);
+          const [gl,sp2]=readU32(raw,sp);
+          let fp=sp2+gl;
+          if(colorMode){const [cl,sp3]=readU32(raw,fp);fp=sp3+cl;}
+          scanP=fp;
+        }else if(ft===0x44){
+          const [mbc,sp]=readU16(raw,scanP+1);
+          let fp=sp+mbc*6;
+          const [,sp2]=readU32(raw,fp);fp=sp2;
+          const [gl,sp3]=readU32(raw,fp);fp=sp3+gl;
+          if(colorMode){const [cl,sp4]=readU32(raw,fp);fp=sp4+cl;}
+          const [dc]=readU32(raw,scanP+1+2+mbc*6);
+          fp+=dc*4;
+          scanP=fp;
+        }else{scanP++;}
+      }
+
+      decoder={raw,offsets,rows,cols,fps,colorMode,palette,glyphs,gDec,cDec,frameCount};
+
+      function getFrame(fi) {
+        if(frames[fi]) return frames[fi];
+        const ft=raw[offsets[fi]];
+        if(ft===0x4b){
+          const {tokens}=decodeKey(raw,offsets[fi],rows,cols,gDec,cDec,colorMode);
+          frames[fi]=tokens; return tokens;
+        }else{
+          const prev=fi>0?(frames[fi-1]??getFrame(fi-1)):frames[0];
+          if(!prev){frames[fi]=frames[0];return frames[0];}
+          const {mbs,deltas}=decodeDelta(raw,offsets[fi],gDec,cDec,colorMode);
+          const predicted=applyMotion(prev,mbs,rows,cols);
+          const result=applyDelta(predicted,deltas,rows,cols);
+          frames[fi]=result; return result;
+        }
+      }
+
+      function renderFrame(tokens) {
+        canvas.width=cols*CW; canvas.height=rows*CH;
+        ctx.fillStyle='#060606'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.font=`bold 11px "JetBrains Mono",monospace`;
+        for(let y=0;y<rows;y++){
+          for(let x=0;x<cols;x++){
+            const t=tokens[y]?.[x]; if(!t) continue;
+            const ch=glyphs[t.g]||' '; if(ch===' ') continue;
+            if(colorMode&&palette[t.c]){const p=palette[t.c];ctx.fillStyle=`rgb(${p.r},${p.g},${p.b})`;}
+            else ctx.fillStyle='#39ff14';
+            ctx.fillText(ch,x*CW,(y+1)*CH-2);
+          }
+        }
+      }
+
+      const f0=getFrame(0);
+      renderFrame(f0);
+      for(let i=1;i<Math.min(15,frameCount);i++) getFrame(i);
+
+      wrap.style.display='flex'; wrap.style.flexDirection='column'; wrap.style.gap='0.5rem';
+      status.style.display='none';
+
+      function tick(now) {
+        if(!playing){return;}
+        const interval=1000/(fps*speed);
+        if(now-lastTime>=interval){
+          lastTime=now;
+          fi=(fi+1)%frameCount;
+          seekEl.value=fi;
+          ctEl.textContent=(fi/fps).toFixed(1)+'s';
+          const tokens=getFrame(fi);
+          if(tokens) renderFrame(tokens);
+        }
+        requestAnimationFrame(tick);
+      }
+
+      playbtn.onclick=()=>{
+        playing=!playing; playbtn.textContent=playing?'⏸':'▶';
+        if(playing){lastTime=performance.now();requestAnimationFrame(tick);}
+      };
+      seekEl.oninput=()=>{
+        fi=parseInt(seekEl.value);
+        ctEl.textContent=(fi/fps).toFixed(1)+'s';
+        const tokens=getFrame(fi); if(tokens) renderFrame(tokens);
+      };
+      speedSel.onchange=()=>{speed=parseFloat(speedSel.value);};
+      dlbtn.onclick=()=>{
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(new Blob([rawData]));
+        a.download=`${id}.atv`; a.click();
+      };
+      document.addEventListener('keydown',e=>{
+        if(e.key===' '){e.preventDefault();playbtn.click();}
+        if(e.key==='ArrowRight'){fi=Math.min(frameCount-1,fi+1);seekEl.value=fi;const t=getFrame(fi);if(t)renderFrame(t);}
+        if(e.key==='ArrowLeft'){fi=Math.max(0,fi-1);seekEl.value=fi;const t=getFrame(fi);if(t)renderFrame(t);}
+      });
+    }
+
+    function buildGlyphsSimple(charset) {
+      const u=[...new Set([...charset])];
+      const arr=new Array(u.length);
+      u.forEach((c,i)=>arr[i]=c);
+      return arr;
+    }
+
+    load().catch(e=>{status.textContent='Error: '+e.message;});
+  </script>
+</body>
+</html>

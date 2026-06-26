@@ -1,0 +1,25 @@
+node_modules
+dist
+.tsbuildinfo
+*.log
+.DS_Store
+node_modules/
+dist/
+.DS_Store
+
+# Rust build artifacts
+wasm-module/target/
+*.wasm
+*.rlib
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
