@@ -1,264 +1,315 @@
 import { initWasm, getWasmModule, isWasmAvailable } from './wasm-wrapper';
 
-// Initialize WASM on module load
+// Initialize WASM immediately
 initWasm().catch(() => {});
 
 export const DEFAULT_CHARSET = " .:-=+*#%@";
 
-export interface AsciiCell {
-  char: string;
-  charIdx: number;
-  r: number;
-  g: number;
-  b: number;
-}
-
-export type AsciiFrame = AsciiCell[][];
-
 export interface AsciiOptions {
-  charset: string;
-  invert: boolean;
+  asciiW: number;
+  asciiH: number;
   brightness: number;
   contrast: number;
-  gamma: number;
   threshold: number;
-  noiseReduction: boolean;
-  histEq: boolean;
-  localContrast: boolean;
+  gamma: number;
+  invert: boolean;
+  color: boolean;
   edges: boolean;
   gradientDirs: boolean;
   dither: boolean;
-  ditherMode: 'floyd' | 'bayer';
-  color: boolean;
-  colorMode: 'grayscale' | 'ansi256' | 'truecolor';
-  asciiW?: number;
-  asciiH?: number;
-  temporalSmoothing?: boolean;
+  ditherMode: "floyd" | "bayer";
+  noiseReduction: boolean;
+  localContrast: boolean;
+  histEq: boolean;
+  charset: string;
+  brailleMode: boolean;
+  blockMode: boolean;
+  temporalSmoothing: boolean;
+  charDensitySort: boolean;
 }
 
 export const DEFAULT_OPTIONS: AsciiOptions = {
-  charset: DEFAULT_CHARSET,
-  invert: false,
-  brightness: 0,
-  contrast: 1,
-  gamma: 1,
-  threshold: 0,
-  noiseReduction: false,
-  histEq: false,
-  localContrast: false,
-  edges: false,
-  gradientDirs: false,
-  dither: false,
-  ditherMode: 'floyd',
-  color: false,
-  colorMode: 'grayscale'
+  asciiW: 140, asciiH: 80, brightness: 0, contrast: 120, threshold: 0, gamma: 1.0,
+  invert: false, color: false, edges: false, gradientDirs: false, dither: false,
+  ditherMode: "floyd", noiseReduction: false, localContrast: false, histEq: false,
+  charset: DEFAULT_CHARSET, brailleMode: false, blockMode: false,
+  temporalSmoothing: false, charDensitySort: true,
 };
 
-let prevFrame: Uint16Array | null = null;
+export interface AsciiCell { char: string; charIdx: number; r: number; g: number; b: number; }
+export type AsciiFrame = AsciiCell[][];
+export type AsciiSource = HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
 
-export function resetTemporalSmoothing() {
-  prevFrame = null;
+function clamp(v: number, lo = 0, hi = 255): number { return v < lo ? lo : v > hi ? hi : v; }
+
+function getSourceDimensions(source: AsciiSource): { w: number; h: number } {
+  if (source instanceof HTMLVideoElement) return { w: source.videoWidth, h: source.videoHeight };
+  if (source instanceof HTMLCanvasElement) return { w: source.width, h: source.height };
+  return { w: source.naturalWidth, h: source.naturalHeight };
 }
 
+class ScratchPool {
+  n = 0;
+  gray = new Float32Array(0); grayB = new Float32Array(0); grayC = new Float32Array(0);
+  mag = new Float32Array(0); dir = new Float32Array(0);
+  r = new Uint8Array(0); g = new Uint8Array(0); b = new Uint8Array(0);
+  charIdx = new Uint16Array(0);
+  hist = new Uint32Array(256); cdf = new Float32Array(256);
+  smoothed: Float32Array | null = null;
+  lastW = 0; lastH = 0;
+
+  ensure(n: number) {
+    if (this.n === n) return;
+    this.n = n;
+    this.gray = new Float32Array(n); this.grayB = new Float32Array(n);
+    this.grayC = new Float32Array(n); this.mag = new Float32Array(n);
+    this.dir = new Float32Array(n); this.r = new Uint8Array(n);
+    this.g = new Uint8Array(n); this.b = new Uint8Array(n);
+    this.charIdx = new Uint16Array(n);
+    this.smoothed = null;
+  }
+}
+
+const pool = new ScratchPool();
+export function resetTemporalSmoothing(): void { pool.smoothed = null; }
+export function getPoolCharIdx(): Uint16Array { return pool.charIdx; }
+export function getPoolColors(): { r: Uint8Array; g: Uint8Array; b: Uint8Array } { return { r: pool.r, g: pool.g, b: pool.b }; }
+export function getPoolDims(): { w: number; h: number } { return { w: pool.lastW, h: pool.lastH }; }
+
+function gaussianBlur3(src: Float32Array, dst: Float32Array, w: number, h: number) {
+  for (let y = 0; y < h; y++) {
+    const y0 = y > 0 ? y - 1 : 0, y1 = y, y2 = y < h - 1 ? y + 1 : h - 1;
+    for (let x = 0; x < w; x++) {
+      const x0 = x > 0 ? x - 1 : 0, x1 = x, x2 = x < w - 1 ? x + 1 : w - 1;
+      dst[y * w + x] = (src[y0 * w + x0] + src[y0 * w + x1] * 2 + src[y0 * w + x2] + src[y1 * w + x0] * 2 + src[y1 * w + x1] * 4 + src[y1 * w + x2] * 2 + src[y2 * w + x0] + src[y2 * w + x1] * 2 + src[y2 * w + x2]) / 16;
+    }
+  }
+}
+
+function sobelEdges(gray: Float32Array, w: number, h: number) {
+  const mag = pool.mag, dir = pool.dir;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = -gray[(y - 1) * w + (x - 1)] + gray[(y - 1) * w + (x + 1)] - 2 * gray[y * w + (x - 1)] + 2 * gray[y * w + (x + 1)] - gray[(y + 1) * w + (x - 1)] + gray[(y + 1) * w + (x + 1)];
+      const gy = -gray[(y - 1) * w + (x - 1)] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + (x + 1)] + gray[(y + 1) * w + (x - 1)] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + (x + 1)];
+      mag[i] = Math.sqrt(gx * gx + gy * gy);
+      dir[i] = Math.atan2(gy, gx);
+    }
+  }
+}
+
+function floydSteinberg(buf: Float32Array, w: number, h: number, levels: number) {
+  const step = 255 / (levels - 1);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const old = buf[i];
+      const nw = Math.round(old / step) * step;
+      buf[i] = nw;
+      const err = old - nw;
+      if (x + 1 < w) buf[i + 1] += err * 0.4375;
+      const nrow = (y + 1) * w;
+      if (y + 1 < h) {
+        if (x > 0) buf[nrow + x - 1] += err * 0.1875;
+        buf[nrow + x] += err * 0.3125;
+        if (x + 1 < w) buf[nrow + x + 1] += err * 0.0625;
+      }
+    }
+  }
+}
+
+function histogramEqualize(buf: Float32Array, n: number) {
+  const hist = pool.hist, cdf = pool.cdf;
+  hist.fill(0);
+  for (let i = 0; i < n; i++) hist[clamp(Math.round(buf[i]))]++;
+  cdf[0] = hist[0];
+  for (let i = 1; i < 256; i++) cdf[i] = cdf[i - 1] + hist[i];
+  let cdfMin = 0;
+  for (let i = 0; i < 256; i++) if (cdf[i] > 0) { cdfMin = cdf[i]; break; }
+  const denom = n - cdfMin || 1;
+  for (let i = 0; i < n; i++) buf[i] = ((cdf[clamp(Math.round(buf[i]))] - cdfMin) / denom) * 255;
+}
+
+const densityCache = new Map<string, string>();
 export function sortCharsetByDensity(charset: string): string {
-  return charset.split('').sort((a, b) => {
-    const map: Record<string, number> = { ' ': 0, '.': 1, ':': 2, '-': 3, '=': 4, '+': 5, '*': 6, '#': 7, '%': 8, '@': 9 };
-    return (map[a] ?? 0) - (map[b] ?? 0);
-  }).join('');
-}
-
-export function getPoolCharIdx(): Uint16Array {
-  return new Uint16Array(0);
-}
-
-export function getPoolDims(): { w: number; h: number } {
-  return { w: 0, h: 0 };
-}
-
-export function processFrame(
-  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
-  offscreen: HTMLCanvasElement,
-  opts: AsciiOptions,
-  mirror: boolean = false
-): AsciiFrame | null {
+  if (densityCache.has(charset)) return densityCache.get(charset)!;
   try {
-    let sw = 0, sh = 0;
-    
-    if (source instanceof HTMLVideoElement) {
-      sw = source.videoWidth;
-      sh = source.videoHeight;
-    } else if (source instanceof HTMLImageElement) {
-      sw = source.naturalWidth || source.width;
-      sh = source.naturalHeight || source.height;
-    } else {
-      sw = source.width;
-      sh = source.height;
-    }
-    
-    if (!sw || !sh || sw <= 0 || sh <= 0) {
-      return null;
-    }
-    
-    const ctx = offscreen.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return null;
-    
-    offscreen.width = sw;
-    offscreen.height = sh;
-    
-    ctx.save();
-    if (mirror) {
-      ctx.translate(sw, 0);
-      ctx.scale(-1, 1);
-    }
-    ctx.drawImage(source, 0, 0, sw, sh);
-    ctx.restore();
-    
-    const imgData = ctx.getImageData(0, 0, sw, sh);
-    const px = imgData.data;
-    const N = sw * sh;
-    
-    const gray = new Uint8Array(N);
-    for (let i = 0; i < N; i++) {
-      gray[i] = Math.round(0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2]);
-    }
-    
-    const charIdx = new Uint16Array(N);
-    const nchars = opts.charset.length;
-    
-    for (let i = 0; i < N; i++) {
-      let val = gray[i] + opts.brightness;
-      val = ((val - 128) * opts.contrast) + 128;
-      if (opts.gamma !== 1) {
-        val = 255 * Math.pow(Math.max(0, val) / 255, 1 / opts.gamma);
-      }
-      val = Math.max(0, Math.min(255, val));
+    const canvas = document.createElement("canvas"); canvas.width = 10; canvas.height = 14;
+    const ctx = canvas.getContext("2d")!; ctx.font = "10px monospace"; ctx.fillStyle = "white";
+    const measured = Array.from(new Set(charset)).map(ch => {
+      ctx.clearRect(0, 0, 10, 14); ctx.fillText(ch, 0, 11);
+      const data = ctx.getImageData(0, 0, 10, 14).data;
+      let sum = 0; for (let i = 0; i < data.length; i += 4) sum += data[i];
+      return { ch, density: sum };
+    });
+    measured.sort((a, b) => a.density - b.density);
+    const sorted = measured.map(m => m.ch).join("");
+    densityCache.set(charset, sorted); return sorted;
+  } catch { densityCache.set(charset, charset); return charset; }
+}
+
+interface CoreResult { w: number; h: number; chars: string; nchars: number; brailleMode: boolean; blockMode: boolean; gradientDirs: boolean; color: boolean; threshold: number; invert: boolean; }
+
+function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean, crop?: { x: number; y: number; w: number; h: number }): CoreResult | null {
+  const { w: sw, h: sh } = getSourceDimensions(source); if (!sw || !sh) return null;
+  const { asciiW, asciiH, brightness, contrast, threshold, gamma, invert, color, edges, gradientDirs, dither, ditherMode, noiseReduction, localContrast, histEq, charset, brailleMode, blockMode, temporalSmoothing, charDensitySort } = opts;
+  const srcX = crop?.x ?? 0, srcY = crop?.y ?? 0, srcW = crop?.w ?? sw, srcH = crop?.h ?? sh;
+  const aspect = srcW / srcH, charAspect = 0.5;
+  let drawW = asciiW, drawH = Math.round(asciiW / aspect * charAspect);
+  if (drawH > asciiH) { drawH = asciiH; drawW = Math.round(asciiH * aspect / charAspect); }
+  drawW = Math.max(1, drawW); drawH = Math.max(1, drawH);
+  if (offscreen.width !== drawW) offscreen.width = drawW;
+  if (offscreen.height !== drawH) offscreen.height = drawH;
+  
+  // ✅ FIX: Always use willReadFrequently: true
+  const ctx = offscreen.getContext("2d", { willReadFrequently: true })!;
+  ctx.save();
+  if (mirror) { ctx.scale(-1, 1); ctx.drawImage(source, srcX, srcY, srcW, srcH, -drawW, 0, drawW, drawH); }
+  else ctx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, drawW, drawH);
+  ctx.restore();
+  
+  const imgData = ctx.getImageData(0, 0, drawW, drawH);
+  const px = imgData.data;
+  const N = drawW * drawH;
+  pool.ensure(N); pool.lastW = drawW; pool.lastH = drawH;
+  const { gray, r: rArr, g: gArr, b: bArr } = pool;
+  
+  // Store RGB for color mode
+  for (let i = 0; i < N; i++) {
+    rArr[i] = px[i * 4];
+    gArr[i] = px[i * 4 + 1];
+    bArr[i] = px[i * 4 + 2];
+  }
+  
+  // 🚀 USE WASM for heavy processing (grayscale + brightness/contrast/gamma + sobel)
+  const useWasm = isWasmAvailable() && !noiseReduction && !histEq && !localContrast;
+  
+  if (useWasm) {
+    try {
+      const wasm = getWasmModule();
+      const contrastNorm = contrast / 100;
       
-      let idx = Math.round((val / 255) * (nchars - 1));
-      if (opts.invert) idx = (nchars - 1) - idx;
-      charIdx[i] = Math.max(0, Math.min(nchars - 1, idx));
-    }
-    
-    const asciiW = opts.asciiW || Math.min(sw, 120);
-    const asciiH = opts.asciiH || Math.min(sh, 68);
-    const scaleX = sw / asciiW;
-    const scaleY = sh / asciiH;
-    
-    const frame: AsciiFrame = [];
-    for (let ay = 0; ay < asciiH; ay++) {
-      const row: AsciiCell[] = [];
-      for (let ax = 0; ax < asciiW; ax++) {
-        const sx = Math.min(Math.floor(ax * scaleX), sw - 1);
-        const sy = Math.min(Math.floor(ay * scaleY), sh - 1);
-        const idx = sy * sw + sx;
-        const charIndex = charIdx[idx];
-        const char = opts.charset[charIndex] || ' ';
-        
-        let r = 255, g = 255, b = 255;
-        if (opts.color) {
-          r = px[idx * 4];
-          g = px[idx * 4 + 1];
-          b = px[idx * 4 + 2];
-        }
-        
-        row.push({ char, charIdx: charIndex, r, g, b });
+      // Call WASM - does grayscale + brightness/contrast/gamma + optional sobel in one shot
+      const wasmResult = wasm.process_full_pipeline(
+        px, drawW, drawH,
+        brightness, contrastNorm, gamma,
+        edges && !gradientDirs // Only do sobel in WASM if not using gradient dirs
+      );
+      
+      // Copy WASM result to pool
+      for (let i = 0; i < N; i++) {
+        gray[i] = wasmResult[i];
       }
-      frame.push(row);
-    }
-    
-    return frame;
-  } catch (err) {
-    console.error('[ASCII] processFrame error:', err);
-    return null;
-  }
-}
-
-export function renderToString(
-  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
-  offscreen: HTMLCanvasElement,
-  opts: AsciiOptions,
-  mirror: boolean = false,
-  format: 'text' | 'html' = 'text'
-): { html: string; isColor: boolean } | null {
-  try {
-    const frame = processFrame(source, offscreen, opts, mirror);
-    
-    if (!frame || !Array.isArray(frame) || frame.length === 0) {
-      return null;
-    }
-    
-    if (!Array.isArray(frame[0])) {
-      return null;
-    }
-    
-    if (format === 'html' && opts.color) {
-      let html = '';
-      for (let i = 0; i < frame.length; i++) {
-        const row = frame[i];
-        for (let j = 0; j < row.length; j++) {
-          const cell = row[j];
-          html += `<span style="color:rgb(${cell.r},${cell.g},${cell.b})">${escapeHtml(cell.char)}</span>`;
-        }
-        html += '\n';
+      
+      // If WASM did sobel, we need to compute mag/dir for gradient dirs
+      if (edges && gradientDirs) {
+        sobelEdges(gray, drawW, drawH);
       }
-      return { html, isColor: true };
-    } else {
-      const lines: string[] = [];
-      for (let i = 0; i < frame.length; i++) {
-        const row = frame[i];
-        let line = '';
-        for (let j = 0; j < row.length; j++) {
-          line += row[j].char;
-        }
-        lines.push(line);
-      }
-      return { html: lines.join('\n'), isColor: false };
+    } catch (e) {
+      console.warn('[ASCII] WASM failed, using JS fallback:', e);
+      processWithJS(px, N, drawW, drawH, brightness, contrast, gamma, edges, noiseReduction, histEq, localContrast);
     }
-  } catch (err) {
-    console.error('[ASCII] renderToString error:', err);
-    return null;
-  }
-}
-
-export function frameToHtml(
-  frame: AsciiFrame,
-  opts: { color: boolean; fontSize?: number; fontFamily?: string }
-): string {
-  const fontSize = opts.fontSize || 12;
-  const fontFamily = opts.fontFamily || 'monospace';
-  let html = `<pre style="font-family: ${fontFamily}; font-size: ${fontSize}px; line-height: 1; margin: 0;">`;
-  
-  for (const row of frame) {
-    if (opts.color) {
-      for (const cell of row) {
-        html += `<span style="color: rgb(${cell.r},${cell.g},${cell.b})">${escapeHtml(cell.char)}</span>`;
-      }
-    } else {
-      for (const cell of row) {
-        html += escapeHtml(cell.char);
-      }
-    }
-    html += '\n';
+  } else {
+    // JS fallback for when WASM not available or heavy features enabled
+    processWithJS(px, N, drawW, drawH, brightness, contrast, gamma, edges, noiseReduction, histEq, localContrast);
   }
   
-  html += '</pre>';
-  return html;
-}
-
-function escapeHtml(str: string): string {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-export function createOffscreenCanvas(): HTMLCanvasElement {
-  return document.createElement('canvas');
-}
-
-export function getAsciiDimensions(sourceW: number, sourceH: number, targetW: number, targetH: number) {
-  const aspect = sourceW / sourceH;
-  let asciiW = targetW;
-  let asciiH = Math.round(targetW / aspect / 2);
-  if (asciiH > targetH) {
-    asciiH = targetH;
-    asciiW = Math.round(targetH * aspect * 2);
+  // Character mapping (still in JS - fast enough)
+  let chars = charset;
+  if (charDensitySort) chars = sortCharsetByDensity(chars);
+  const nchars = chars.length, denom = nchars - 1;
+  const charIdx = pool.charIdx;
+  
+  if (dither) {
+    const buf = pool.grayC; buf.set(gray);
+    if (ditherMode === "floyd") floydSteinberg(buf, drawW, drawH, nchars);
+    else { const bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]; for (let y = 0; y < drawH; y++) for (let x = 0; x < drawW; x++) { const i = y * drawW + x; const th = (bayer[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * (255 / nchars); buf[i] = clamp(buf[i] + th); } }
+    for (let i = 0; i < N; i++) { const lum = buf[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
+  } else {
+    for (let i = 0; i < N; i++) { const lum = gray[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
   }
-  return { asciiW, asciiH };
+  
+  if (temporalSmoothing) { if (!pool.smoothed) pool.smoothed = new Float32Array(N); const sm = pool.smoothed; for (let i = 0; i < N; i++) sm[i] = sm[i] * 0.6 + charIdx[i] * 0.4; for (let i = 0; i < N; i++) charIdx[i] = Math.round(sm[i]); }
+  if (gradientDirs) { for (let i = 0; i < N; i++) { if (pool.mag[i] > 40) { const deg = ((dir[i] * 180 / Math.PI) + 180) % 180; const li = deg < 22.5 || deg >= 157.5 ? 0 : deg < 67.5 ? 1 : deg < 112.5 ? 2 : 3; charIdx[i] = 0x4000 | li; } } }
+  return { w: drawW, h: drawH, chars, nchars, brailleMode: false, blockMode: false, gradientDirs, color, threshold, invert };
 }
+
+// JS fallback processing
+function processWithJS(px: Uint8ClampedArray, N: number, drawW: number, drawH: number, brightness: number, contrast: number, gamma: number, edges: boolean, noiseReduction: boolean, histEq: boolean, localContrast: boolean) {
+  const { gray } = pool;
+  const applyGamma = gamma !== 1.0, applyContrast = contrast !== 100, invGamma = 1 / gamma;
+  
+  if (applyGamma && applyContrast) {
+    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b; lum = ((lum - 128) * (contrast / 100)) + 128 + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
+  } else if (applyContrast) {
+    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b; gray[i] = clamp(((lum - 128) * (contrast / 100)) + 128 + brightness); }
+  } else if (applyGamma) {
+    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
+  } else {
+    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; gray[i] = clamp(0.299 * r + 0.587 * g + 0.114 * b + brightness); }
+  }
+  
+  if (noiseReduction) { gaussianBlur3(gray, pool.grayB, drawW, drawH); gray.set(pool.grayB); }
+  if (histEq) histogramEqualize(gray, N);
+  if (localContrast) { gaussianBlur3(gray, pool.grayB, drawW, drawH); for (let i = 0; i < N; i++) gray[i] = clamp(gray[i] * 1.2 - pool.grayB[i] * 0.2 + 25); }
+  if (edges) sobelEdges(gray, drawW, drawH);
+}
+
+const LINE_CHARS = ["-", "/", "|", "\\"];
+const _rgbCache = new Map<number, string>();
+function rgbStr(r: number, g: number, b: number): string { const k = (r << 16) | (g << 8) | b; let s = _rgbCache.get(k); if (!s) { s = `rgb(${r},${g},${b})`; if (_rgbCache.size < 32768) _rgbCache.set(k, s); } return s; }
+function escChar(s: string): string { return s === "&" ? "&" : s === "<" ? "<" : s === ">" ? ">" : s; }
+
+export function renderToString(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean, mode: "html" | "text", crop?: { x: number; y: number; w: number; h: number }): { html: string; isColor: boolean } | null {
+  const core = runCore(source, offscreen, opts, mirror, crop);
+  if (!core) return null;
+  if (core.brailleMode) return { html: buildBrailleString(core, mode), isColor: mode === "html" && core.color };
+  const { w, h, chars, color } = core;
+  const charIdx = pool.charIdx, rArr = pool.r, gArr = pool.g, bArr = pool.b;
+  const lines: string[] = new Array(h);
+  if (mode === "text") { for (let y = 0; y < h; y++) { let line = ""; for (let x = 0; x < w; x++) { const idx = charIdx[y * w + x]; line += idx & 0x4000 ? LINE_CHARS[idx & 3] : chars[idx] || " "; } lines[y] = line; } return { html: lines.join("\n"), isColor: false }; }
+  if (!color) { for (let y = 0; y < h; y++) { let line = ""; for (let x = 0; x < w; x++) { const idx = charIdx[y * w + x]; line += escChar(idx & 0x4000 ? LINE_CHARS[idx & 3] : chars[idx] || " "); } lines[y] = line; } return { html: lines.join("\n"), isColor: false }; }
+  for (let y = 0; y < h; y++) { const parts: string[] = []; let runR = -1, runG = -1, runB = -1, runText = ""; for (let x = 0; x < w; x++) { const i = y * w + x, idx = charIdx[i]; const cr = rArr[i], cg = gArr[i], cb = bArr[i]; const disp = escChar(idx & 0x4000 ? LINE_CHARS[idx & 3] : chars[idx] || " "); if (cr === runR && cg === runG && cb === runB) runText += disp; else { if (runText) parts.push(`<span style="color:${rgbStr(runR, runG, runB)}">${runText}</span>`); runR = cr; runG = cg; runB = cb; runText = disp; } } if (runText) parts.push(`<span style="color:${rgbStr(runR, runG, runB)}">${runText}</span>`); lines[y] = parts.join(""); }
+  return { html: lines.join("\n"), isColor: true };
+}
+
+function buildBrailleString(core: CoreResult, mode: "html" | "text"): string {
+  const { w: srcW, h: srcH, threshold, invert, color } = core;
+  const gray = pool.gray, rArr = pool.r, gArr = pool.g, bArr = pool.b;
+  const th = threshold > 0 ? threshold : 128, bW = Math.floor(srcW / 2), bH = Math.floor(srcH / 4);
+  const lines: string[] = new Array(bH);
+  const BRAILLE_BASE = 0x2800;
+  const BRAILLE_DOTS = [0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80];
+  for (let cy = 0; cy < bH; cy++) { let line = ""; for (let cx = 0; cx < bW; cx++) { let bits = 0, tr = 0, tg = 0, tb = 0; for (let dy = 0; dy < 4; dy++) for (let dx = 0; dx < 2; dx++) { const i = (cy * 4 + dy) * srcW + (cx * 2 + dx); if ((gray[i] >= th) !== invert) bits |= BRAILLE_DOTS[dy * 2 + dx]; tr += rArr[i] ?? 0; tg += gArr[i] ?? 0; tb += bArr[i] ?? 0; } const ch = String.fromCodePoint(BRAILLE_BASE | bits); if (mode === "text" || !color) line += ch; else line += `<span style="color:${rgbStr(Math.round(tr / 8), Math.round(tg / 8), Math.round(tb / 8))}">${ch}</span>`; } lines[cy] = line; }
+  return lines.join("\n");
+}
+
+export function processFrame(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror = true, crop?: { x: number; y: number; w: number; h: number }): AsciiFrame | null {
+  const core = runCore(source, offscreen, opts, mirror, crop);
+  if (!core) return null;
+  if (core.brailleMode) return brailleCore(core);
+  const { w, h, chars, color } = core;
+  const charIdx = pool.charIdx, rArr = pool.r, gArr = pool.g, bArr = pool.b;
+  const frame: AsciiFrame = new Array(h);
+  for (let y = 0; y < h; y++) { const row: AsciiCell[] = new Array(w); for (let x = 0; x < w; x++) { const i = y * w + x, idx = charIdx[i]; const ch = idx & 0x4000 ? LINE_CHARS[idx & 3] : chars[idx] || " "; row[x] = { char: ch, charIdx: idx, r: color ? rArr[i] : 0, g: color ? gArr[i] : 0, b: color ? bArr[i] : 0 }; } frame[y] = row; }
+  return frame;
+}
+
+function brailleCore(core: CoreResult): AsciiFrame {
+  const { w: srcW, h: srcH, threshold, invert, color } = core;
+  const gray = pool.gray, rArr = pool.r, gArr = pool.g, bArr = pool.b;
+  const th = threshold > 0 ? threshold : 128, bW = Math.floor(srcW / 2), bH = Math.floor(srcH / 4);
+  const frame: AsciiFrame = [];
+  const BRAILLE_BASE = 0x2800;
+  const BRAILLE_DOTS = [0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80];
+  for (let cy = 0; cy < bH; cy++) { const row: AsciiCell[] = []; for (let cx = 0; cx < bW; cx++) { let bits = 0, tr = 0, tg = 0, tb = 0; for (let dy = 0; dy < 4; dy++) for (let dx = 0; dx < 2; dx++) { const i = (cy * 4 + dy) * srcW + (cx * 2 + dx); if ((gray[i] >= th) !== invert) bits |= BRAILLE_DOTS[dy * 2 + dx]; tr += rArr[i] ?? 0; tg += gArr[i] ?? 0; tb += bArr[i] ?? 0; } row.push({ char: String.fromCodePoint(BRAILLE_BASE | bits), charIdx: bits, r: color ? Math.round(tr / 8) : 0, g: color ? Math.round(tg / 8) : 0, b: color ? Math.round(tb / 8) : 0 }); } frame.push(row); }
+  return frame;
+}
+
+export function frameToHtml(frame: AsciiFrame, color: boolean): string {
+  if (!color) return frame.map(row => row.map(c => c.char === " " ? "\u00a0" : escChar(c.char)).join("")).join("\n");
+  return frame.map(row => { const parts: string[] = []; let runR = -1, runG = -1, runB = -1, runText = ""; for (const c of row) { const disp = c.char === " " ? "\u00a0" : escChar(c.char); if (c.r === runR && c.g === runG && c.b === runB) runText += disp; else { if (runText) parts.push(`<span style="color:${rgbStr(runR, runG, runB)}">${runText}</span>`); runR = c.r; runG = c.g; runB = c.b; runText = disp; } } if (runText) parts.push(`<span style="color:${rgbStr(runR, runG, runB)}">${runText}</span>`); return parts.join(""); }).join("\n");
+}
+
+export function frameToText(frame: AsciiFrame): string { return frame.map(row => row.map(c => c.char).join("")).join("\n"); }

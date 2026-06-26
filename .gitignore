@@ -9,7 +9,6 @@ dist/
 
 # Rust build artifacts
 wasm-module/target/
-*.wasm
 *.rlib
 
 # Node

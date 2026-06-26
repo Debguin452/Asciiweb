@@ -3,25 +3,7 @@ import { encode, decode, toArrayBuffer, type RemoteFrame } from "./binary";
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun2.l.google.com:19302" },
-  { urls: "stun:stun3.l.google.com:19302" },
-  { urls: "stun:stun4.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
-  {
-    urls: "turn:openrelay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject"
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject"
-  },
-];
-
-const PEER_OPTIONS = [
-  { config: { iceServers: ICE_SERVERS }, debug: 1 },
-  { config: { iceServers: ICE_SERVERS }, debug: 1, pingInterval: 10000 },
 ];
 
 export type CallQualityLevel = "low" | "medium" | "high" | "ultra";
@@ -33,10 +15,10 @@ export interface CallQualityStep {
 }
 
 const QUALITY_STEPS: Record<CallQualityLevel, CallQualityStep> = {
-  low:    { keyframeInterval: 60, targetFps: 10, maxFrameSize: 16000 },
-  medium: { keyframeInterval: 40, targetFps: 20, maxFrameSize: 32000 },
-  high:   { keyframeInterval: 30, targetFps: 30, maxFrameSize: 64000 },
-  ultra:  { keyframeInterval: 20, targetFps: 45, maxFrameSize: 128000 },
+  low:    { keyframeInterval: 60, targetFps: 10, maxFrameSize: 8000 },
+  medium: { keyframeInterval: 40, targetFps: 20, maxFrameSize: 16000 },
+  high:   { keyframeInterval: 30, targetFps: 30, maxFrameSize: 32000 },
+  ultra:  { keyframeInterval: 20, targetFps: 45, maxFrameSize: 64000 },
 };
 
 const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra"];
@@ -75,7 +57,6 @@ export class CallManager {
   
   private receivedKeyframe = false;
   private lastKeyframeAt = 0;
-  private maxDeltaWithoutKeyframe = 5000;
   
   private qualityLevel: CallQualityLevel = "high";
   private recentSends = 0;
@@ -85,10 +66,6 @@ export class CallManager {
   private consecutiveGood = 0;
   private consecutiveBad = 0;
   private readonly CHECK_FRAMES = 30;
-  
-  private frameBuffer: Array<{ frame: RemoteFrame; timestamp: number }> = [];
-  private jitterBufferSize = 3;
-  private lastRenderedFrameTime = 0;
 
   constructor(events: CallManagerEvents) { 
     this.events = events; 
@@ -96,67 +73,37 @@ export class CallManager {
 
   async start(): Promise<string> {
     return new Promise((resolve, reject) => {
-      let attemptIndex = 0;
+      const peer = new Peer({ config: { iceServers: ICE_SERVERS }, debug: 1 });
+      this.peer = peer;
       
-      const tryConnect = () => {
-        if (attemptIndex >= PEER_OPTIONS.length) {
-          reject(new Error("All signaling servers failed"));
-          return;
+      const timeout = setTimeout(() => {
+        reject(new Error("Signaling timeout"));
+      }, 10000);
+
+      peer.on("open", id => {
+        clearTimeout(timeout);
+        this.events.onStatus("waiting", id);
+        resolve(id);
+      });
+
+      peer.on("connection", conn => this.attachData(conn));
+
+      peer.on("call", call => {
+        this.mediaConn = call;
+        if (this.localStream) {
+          call.answer(this.localStream);
+          call.on("stream", s => this.events.onRemoteStream(s));
+          call.on("close", () => this.events.onRemoteHangup());
+        } else {
+          this.pendingIncomingCall = call;
         }
-        
-        const opts = PEER_OPTIONS[attemptIndex];
-        const peer = new Peer(opts);
-        this.peer = peer;
-        
-        const timeout = setTimeout(() => {
-          console.warn(`Signaling attempt ${attemptIndex + 1} timed out`);
-          try { peer.destroy(); } catch {}
-          attemptIndex++;
-          tryConnect();
-        }, 8000);
+      });
 
-        peer.on("open", id => {
-          clearTimeout(timeout);
-          this.events.onStatus("waiting", id);
-          resolve(id);
-        });
-
-        peer.on("connection", conn => this.attachData(conn));
-
-        peer.on("call", call => {
-          this.mediaConn = call;
-          if (this.localStream) {
-            call.answer(this.localStream);
-            call.on("stream", s => this.events.onRemoteStream(s));
-            call.on("close", () => this.events.onRemoteHangup());
-            call.on("error", () => this.events.onRemoteHangup());
-          } else {
-            this.pendingIncomingCall = call;
-          }
-        });
-
-        peer.on("error", err => {
-          clearTimeout(timeout);
-          attemptIndex++;
-          if (attemptIndex < PEER_OPTIONS.length) {
-            try { peer.destroy(); } catch {}
-            setTimeout(tryConnect, 500);
-          } else {
-            this.events.onStatus("error", err.message);
-            reject(err);
-          }
-        });
-
-        peer.on("disconnected", () => {
-          setTimeout(() => { 
-            try { 
-              if (peer && !peer.destroyed) peer.reconnect(); 
-            } catch {} 
-          }, 2000);
-        });
-      };
-      
-      tryConnect();
+      peer.on("error", err => {
+        clearTimeout(timeout);
+        this.events.onStatus("error", err.message);
+        reject(err);
+      });
     });
   }
 
@@ -168,7 +115,6 @@ export class CallManager {
       call.answer(stream);
       call.on("stream", s => this.events.onRemoteStream(s));
       call.on("close", () => this.events.onRemoteHangup());
-      call.on("error", () => this.events.onRemoteHangup());
     }
   }
 
@@ -179,8 +125,7 @@ export class CallManager {
 
     const conn = this.peer.connect(remoteId.trim(), { 
       reliable: true, 
-      serialization: "binary",
-      metadata: { version: 1 }
+      serialization: "binary"
     });
     this.attachData(conn);
 
@@ -189,7 +134,6 @@ export class CallManager {
       this.mediaConn = call;
       call.on("stream", s => this.events.onRemoteStream(s));
       call.on("close", () => this.events.onRemoteHangup());
-      call.on("error", () => this.events.onRemoteHangup());
     }
   }
 
@@ -203,9 +147,7 @@ export class CallManager {
     if (idx === -1) return;
 
     if ((dropRate > 0.3 || avgLatency > 200) && idx > 0) {
-      this.consecutiveGood = 0;
       this.consecutiveBad++;
-      
       if (this.consecutiveBad >= 2) {
         const next = QUALITY_ORDER[idx - 1];
         this.qualityLevel = next;
@@ -215,9 +157,7 @@ export class CallManager {
         this.events.onQualityChange?.(next, QUALITY_STEPS[next]);
       }
     } else if (dropRate < 0.05 && avgLatency < 100) {
-      this.consecutiveBad = 0;
       this.consecutiveGood++;
-      
       if (this.consecutiveGood >= 3 && idx < QUALITY_ORDER.length - 1) {
         this.consecutiveGood = 0;
         const next = QUALITY_ORDER[idx + 1];
@@ -226,9 +166,6 @@ export class CallManager {
         this.targetFps = QUALITY_STEPS[next].targetFps;
         this.events.onQualityChange?.(next, QUALITY_STEPS[next]);
       }
-    } else {
-      this.consecutiveGood = 0;
-      this.consecutiveBad = 0;
     }
   }
 
@@ -239,75 +176,33 @@ export class CallManager {
       this.events.onStatus("connected");
       this.receivedKeyframe = false;
       this.prevRecvFrame = null;
-      this.frameBuffer = [];
     });
     
     conn.on("data", (data: unknown) => {
-      if (data && typeof data === "object" && !ArrayBuffer.isView(data)
-        && !(data instanceof Blob) && !(data instanceof ArrayBuffer)
-        && "type" in (data as Record<string, unknown>)
-        && (data as { type: string }).type === "state") {
-        const st = data as { type: string; micMuted: boolean; camOff: boolean };
+      if (data && typeof data === "object" && "type" in (data as any) && (data as any).type === "state") {
+        const st = data as any;
         this.events.onRemoteState?.({ micMuted: st.micMuted, camOff: st.camOff });
         return;
       }
       
       const buf = toArrayBuffer(data);
       if (buf) {
-        const sendTime = performance.now();
         const frame = decode(buf, this.prevRecvFrame);
-        
         if (frame) {
           if (frame.isKeyframe) {
             this.receivedKeyframe = true;
-            this.lastKeyframeAt = sendTime;
+            this.lastKeyframeAt = performance.now();
+          }
+          if (frame.isKeyframe || this.receivedKeyframe) {
             this.prevRecvFrame = frame;
             this.events.onRemoteFrame(frame);
-            this.lastRenderedFrameTime = sendTime;
-          } else if (this.receivedKeyframe) {
-            if (sendTime - this.lastKeyframeAt > this.maxDeltaWithoutKeyframe) {
-              console.warn("Too long without keyframe, discarding delta");
-              return;
-            }
-            
-            this.prevRecvFrame = frame;
-            this.frameBuffer.push({ frame, timestamp: sendTime });
-            this.flushJitterBuffer();
           }
         }
-        return;
-      }
-      
-      if (data instanceof Blob) {
-        data.arrayBuffer().then(ab => {
-          const frame = decode(ab, this.prevRecvFrame);
-          if (frame) {
-            if (frame.isKeyframe) {
-              this.receivedKeyframe = true;
-              this.lastKeyframeAt = performance.now();
-            }
-            if (frame.isKeyframe || this.receivedKeyframe) {
-              this.prevRecvFrame = frame;
-              this.events.onRemoteFrame(frame);
-            }
-          }
-        }).catch(() => {});
       }
     });
     
     conn.on("close", () => this.events.onStatus("closed"));
     conn.on("error", err => this.events.onStatus("error", err.message));
-  }
-  
-  private flushJitterBuffer() {
-    if (this.frameBuffer.length < this.jitterBufferSize) return;
-    
-    this.frameBuffer.sort((a, b) => a.timestamp - b.timestamp);
-    const toRender = this.frameBuffer.shift();
-    if (toRender) {
-      this.events.onRemoteFrame(toRender.frame);
-      this.lastRenderedFrameTime = toRender.timestamp;
-    }
   }
 
   sendFrame(
@@ -343,25 +238,10 @@ export class CallManager {
       this.recentLatencies.push(latency);
       if (this.recentLatencies.length > 20) this.recentLatencies.shift();
       
-      if (isKey || !this.prevSentIndices) {
-        this.prevSentIndices = new Uint16Array(charIndices);
-        this.prevSentColors = colors ? new Uint8Array(colors) : null;
-      } else if (this.prevSentIndices.length === charIndices.length) {
-        this.prevSentIndices.set(charIndices);
-        if (colors && this.prevSentColors && this.prevSentColors.length === colors.length) {
-          this.prevSentColors.set(colors);
-        } else if (colors) {
-          this.prevSentColors = new Uint8Array(colors);
-        } else {
-          this.prevSentColors = null;
-        }
-      } else {
-        this.prevSentIndices = new Uint16Array(charIndices);
-        this.prevSentColors = colors ? new Uint8Array(colors) : null;
-      }
+      this.prevSentIndices = new Uint16Array(charIndices);
+      this.prevSentColors = colors ? new Uint8Array(colors) : null;
     } catch (err) {
       this.recentDrops++;
-      console.warn("Frame send failed:", err);
     }
 
     this.qualityCheckCounter++;
@@ -375,63 +255,25 @@ export class CallManager {
 
   sendState(micMuted: boolean, camOff: boolean) {
     if (!this.dataConn?.open) return;
-    try { 
-      this.dataConn.send({ type: "state", micMuted, camOff }); 
-    } catch {}
+    try { this.dataConn.send({ type: "state", micMuted, camOff }); } catch {}
   }
 
   hangup() {
-    this.frameCount = 0;
-    this.prevSentIndices = null;
-    this.prevSentColors = null;
-    this.prevRecvFrame = null;
-    this.pendingIncomingCall = null;
-    this.recentSends = 0;
-    this.recentDrops = 0;
-    this.recentLatencies = [];
-    this.qualityCheckCounter = 0;
-    this.consecutiveGood = 0;
-    this.consecutiveBad = 0;
-    this.qualityLevel = "high";
-    this.keyframeInterval = 30;
-    this.targetFps = 30;
-    this.receivedKeyframe = false;
-    this.lastKeyframeAt = 0;
-    this.frameBuffer = [];
-    
     try { this.dataConn?.close(); } catch {}
     try { this.mediaConn?.close(); } catch {}
     try { this.peer?.destroy(); } catch {}
-    
     this.dataConn = null;
     this.mediaConn = null;
     this.peer = null;
-    this.localStream = null;
   }
 
-  setTargetFps(fps: number) { 
-    this.targetFps = Math.max(5, Math.min(60, fps)); 
-  }
-  
+  setTargetFps(fps: number) { this.targetFps = Math.max(5, Math.min(60, fps)); }
   getQualityLevel(): CallQualityLevel { return this.qualityLevel; }
   
-  setQualityLevel(level: CallQualityLevel) {
-    this.qualityLevel = level;
-    this.keyframeInterval = QUALITY_STEPS[level].keyframeInterval;
-    this.targetFps = QUALITY_STEPS[level].targetFps;
-  }
-  
-  getStats(): { 
-    quality: CallQualityLevel; 
-    fps: number; 
-    keyframeInterval: number;
-    latency: number;
-    drops: number;
-  } {
+  getStats() {
     const avgLatency = this.recentLatencies.length > 0
       ? this.recentLatencies.reduce((a, b) => a + b, 0) / this.recentLatencies.length
       : 0;
-    
     return {
       quality: this.qualityLevel,
       fps: this.targetFps,
