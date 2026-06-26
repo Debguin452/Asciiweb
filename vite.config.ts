@@ -3,17 +3,16 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-    optimizeDeps: {
-      exclude: ['asciiweb_wasm', './src/lib/wasm-pkg']
-    },
-    assetsInclude: ['**/*.wasm'],
-    server: {
-      headers: {
-        'Cross-Origin-Opener-Policy': 'same-origin',
-        'Cross-Origin-Embedder-Policy': 'require-corp'
-      }
-    },
+  server: {
+    hmr: {
+      clientPort: 5173,
+      host: 'localhost',
+      protocol: 'ws'
+    }
+  },
   build: {
     target: 'esnext',
+    assetsInlineLimit: 0,
   },
+  publicDir: 'public',
 });

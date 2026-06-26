@@ -410,13 +410,54 @@ export default function CallTab({ opts, updateOpt }: Props) {
   };
 
   const startCall = async () => {
+    console.log('[CallTab] 🚀 Starting call...');
     setStarting(true); setCamErr(null); setConnectErr(null);
-    await startCam();
-    if (!myIdRef.current) await new Promise(r => setTimeout(r, 1500));
-    const code = await apiCreate(myIdRef.current) ?? myIdRef.current.slice(0, 8).toUpperCase();
-    roomRef.current = code; modeRef.current = "host";
-    setMode("host"); setMyCode(code); setScreen("starting"); setStarting(false);
+    
+    try {
+      await startCam();
+    } catch (e) {
+      setCamErr(e instanceof Error ? e.message : "Camera failed");
+      setStarting(false);
+      return;
+    }
+
+    // Wait for PeerJS to connect and give us an ID
+    let attempts = 0;
+    while (!myIdRef.current && attempts < 20) {
+      await new Promise(r => setTimeout(r, 500));
+      attempts++;
+    }
+
+    if (!myIdRef.current) {
+      setConnectErr("Call system failed to connect. Check internet.");
+      setStarting(false);
+      return;
+    }
+
+    // Try Cloudflare API for short code, fallback to PeerJS ID locally
+    let code = myIdRef.current;
+    try {
+      const res = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: myIdRef.current })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.code) code = data.code;
+      }
+    } catch (e) {
+      console.warn('[CallTab] ⚠️ API unavailable, using PeerJS ID as code');
+    }
+
+    roomRef.current = code;
+    modeRef.current = "host";
+    setMode("host");
+    setMyCode(code);
+    setScreen("starting");
+    setStarting(false);
   };
+
 
   const joinCall = async () => {
     const code = joinVal.trim().toUpperCase();
