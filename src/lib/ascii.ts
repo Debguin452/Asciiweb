@@ -1,8 +1,5 @@
 import { initWasm, getWasmModule, isWasmAvailable } from './wasm-wrapper';
 
-// Initialize WASM immediately
-initWasm().catch(() => {});
-
 export const DEFAULT_CHARSET = " .:-=+*#%@";
 
 export interface AsciiOptions {
@@ -161,66 +158,59 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
   drawW = Math.max(1, drawW); drawH = Math.max(1, drawH);
   if (offscreen.width !== drawW) offscreen.width = drawW;
   if (offscreen.height !== drawH) offscreen.height = drawH;
-  
-  // ✅ FIX: Always use willReadFrequently: true
   const ctx = offscreen.getContext("2d", { willReadFrequently: true })!;
   ctx.save();
   if (mirror) { ctx.scale(-1, 1); ctx.drawImage(source, srcX, srcY, srcW, srcH, -drawW, 0, drawW, drawH); }
   else ctx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, drawW, drawH);
   ctx.restore();
-  
-  const imgData = ctx.getImageData(0, 0, drawW, drawH);
-  const px = imgData.data;
-  const N = drawW * drawH;
+  const imgData = ctx.getImageData(0, 0, drawW, drawH), px = imgData.data, N = drawW * drawH;
   pool.ensure(N); pool.lastW = drawW; pool.lastH = drawH;
   const { gray, r: rArr, g: gArr, b: bArr } = pool;
-  
-  // Store RGB for color mode
-  for (let i = 0; i < N; i++) {
-    rArr[i] = px[i * 4];
-    gArr[i] = px[i * 4 + 1];
-    bArr[i] = px[i * 4 + 2];
-  }
-  
-  // 🚀 USE WASM for heavy processing (grayscale + brightness/contrast/gamma + sobel)
-  const useWasm = isWasmAvailable() && !noiseReduction && !histEq && !localContrast;
-  
-  if (useWasm) {
+  const invGamma = 1 / gamma;
+
+  let wasmUsed = false;
+  const canUseWasm = isWasmAvailable() && !noiseReduction && !histEq && !localContrast && !dither && !brailleMode;
+
+  if (canUseWasm) {
     try {
       const wasm = getWasmModule();
-      const contrastNorm = contrast / 100;
-      
-      // Call WASM - does grayscale + brightness/contrast/gamma + optional sobel in one shot
       const wasmResult = wasm.process_full_pipeline(
         px, drawW, drawH,
-        brightness, contrastNorm, gamma,
-        edges && !gradientDirs // Only do sobel in WASM if not using gradient dirs
+        brightness, contrast / 100, gamma,
+        edges
       );
-      
-      // Copy WASM result to pool
       for (let i = 0; i < N; i++) {
         gray[i] = wasmResult[i];
+        rArr[i] = px[i * 4];
+        gArr[i] = px[i * 4 + 1];
+        bArr[i] = px[i * 4 + 2];
       }
-      
-      // If WASM did sobel, we need to compute mag/dir for gradient dirs
-      if (edges && gradientDirs) {
-        sobelEdges(gray, drawW, drawH);
-      }
-    } catch (e) {
-      console.warn('[ASCII] WASM failed, using JS fallback:', e);
-      processWithJS(px, N, drawW, drawH, brightness, contrast, gamma, edges, noiseReduction, histEq, localContrast);
-    }
-  } else {
-    // JS fallback for when WASM not available or heavy features enabled
-    processWithJS(px, N, drawW, drawH, brightness, contrast, gamma, edges, noiseReduction, histEq, localContrast);
+      wasmUsed = true;
+    } catch (err) {
+}
   }
-  
-  // Character mapping (still in JS - fast enough)
+
+  if (!wasmUsed) {
+    const applyGamma = gamma !== 1.0, applyContrast = contrast !== 100;
+    if (applyGamma && applyContrast) {
+      for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; rArr[i] = r; gArr[i] = g; bArr[i] = b; let lum = 0.299 * r + 0.587 * g + 0.114 * b; lum = ((lum - 128) * (contrast / 100)) + 128 + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
+    } else if (applyContrast) {
+      for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; rArr[i] = r; gArr[i] = g; bArr[i] = b; let lum = 0.299 * r + 0.587 * g + 0.114 * b; gray[i] = clamp(((lum - 128) * (contrast / 100)) + 128 + brightness); }
+    } else if (applyGamma) {
+      for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; rArr[i] = r; gArr[i] = g; bArr[i] = b; let lum = 0.299 * r + 0.587 * g + 0.114 * b + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
+    } else {
+      for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; rArr[i] = r; gArr[i] = g; bArr[i] = b; gray[i] = clamp(0.299 * r + 0.587 * g + 0.114 * b + brightness); }
+    }
+    if (noiseReduction) { gaussianBlur3(gray, pool.grayB, drawW, drawH); gray.set(pool.grayB); }
+    if (histEq) histogramEqualize(gray, N);
+    if (localContrast) { gaussianBlur3(gray, pool.grayB, drawW, drawH); for (let i = 0; i < N; i++) gray[i] = clamp(gray[i] * 1.2 - pool.grayB[i] * 0.2 + 25); }
+    if (edges) sobelEdges(gray, drawW, drawH);
+  }
+
   let chars = charset;
   if (charDensitySort) chars = sortCharsetByDensity(chars);
   const nchars = chars.length, denom = nchars - 1;
   const charIdx = pool.charIdx;
-  
   if (dither) {
     const buf = pool.grayC; buf.set(gray);
     if (ditherMode === "floyd") floydSteinberg(buf, drawW, drawH, nchars);
@@ -229,31 +219,9 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
   } else {
     for (let i = 0; i < N; i++) { const lum = gray[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
   }
-  
   if (temporalSmoothing) { if (!pool.smoothed) pool.smoothed = new Float32Array(N); const sm = pool.smoothed; for (let i = 0; i < N; i++) sm[i] = sm[i] * 0.6 + charIdx[i] * 0.4; for (let i = 0; i < N; i++) charIdx[i] = Math.round(sm[i]); }
   if (gradientDirs) { for (let i = 0; i < N; i++) { if (pool.mag[i] > 40) { const deg = ((dir[i] * 180 / Math.PI) + 180) % 180; const li = deg < 22.5 || deg >= 157.5 ? 0 : deg < 67.5 ? 1 : deg < 112.5 ? 2 : 3; charIdx[i] = 0x4000 | li; } } }
   return { w: drawW, h: drawH, chars, nchars, brailleMode: false, blockMode: false, gradientDirs, color, threshold, invert };
-}
-
-// JS fallback processing
-function processWithJS(px: Uint8ClampedArray, N: number, drawW: number, drawH: number, brightness: number, contrast: number, gamma: number, edges: boolean, noiseReduction: boolean, histEq: boolean, localContrast: boolean) {
-  const { gray } = pool;
-  const applyGamma = gamma !== 1.0, applyContrast = contrast !== 100, invGamma = 1 / gamma;
-  
-  if (applyGamma && applyContrast) {
-    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b; lum = ((lum - 128) * (contrast / 100)) + 128 + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
-  } else if (applyContrast) {
-    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b; gray[i] = clamp(((lum - 128) * (contrast / 100)) + 128 + brightness); }
-  } else if (applyGamma) {
-    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; let lum = 0.299 * r + 0.587 * g + 0.114 * b + brightness; gray[i] = clamp(255 * Math.pow(clamp(lum) / 255, invGamma)); }
-  } else {
-    for (let i = 0; i < N; i++) { const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2]; gray[i] = clamp(0.299 * r + 0.587 * g + 0.114 * b + brightness); }
-  }
-  
-  if (noiseReduction) { gaussianBlur3(gray, pool.grayB, drawW, drawH); gray.set(pool.grayB); }
-  if (histEq) histogramEqualize(gray, N);
-  if (localContrast) { gaussianBlur3(gray, pool.grayB, drawW, drawH); for (let i = 0; i < N; i++) gray[i] = clamp(gray[i] * 1.2 - pool.grayB[i] * 0.2 + 25); }
-  if (edges) sobelEdges(gray, drawW, drawH);
 }
 
 const LINE_CHARS = ["-", "/", "|", "\\"];

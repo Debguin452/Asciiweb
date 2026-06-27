@@ -6,12 +6,10 @@ let wasmError: string | null = null;
 
 export async function initWasm(): Promise<void> {
   if (wasmInitPromise) return wasmInitPromise;
-  console.log('[WASM] 🚀 Starting initialization...');
   wasmInitPromise = (async () => {
     try {
       const wasmPath = '/wasm/asciiweb_wasm.js';
-      console.log('[WASM] 📦 Loading from:', wasmPath);
-      const wasm = await import(/* @vite-ignore */ wasmPath);
+      const wasm = await import( wasmPath);
       if (wasm.default && typeof wasm.default === 'function') {
         await wasm.default('/wasm/asciiweb_wasm_bg.wasm');
       }
@@ -19,9 +17,7 @@ export async function initWasm(): Promise<void> {
       wasmAvailable = true;
       wasmReady = true;
       const functions = Object.keys(wasm).filter(k => typeof wasm[k] === 'function');
-      console.log('[WASM] ✅ Ready! Functions:', functions);
     } catch (err) {
-      console.error('[WASM] ❌ Failed to load:', err);
       wasmError = err instanceof Error ? err.message : String(err);
       wasmAvailable = false;
     }
@@ -42,4 +38,4 @@ export function getWasmStatus() {
     functions: wasmModule ? Object.keys(wasmModule).filter(k => typeof wasmModule[k] === 'function') : []
   };
 }
-initWasm().catch(err => console.error('[WASM] Auto-init failed:', err));
+initWasm().catch(err =>

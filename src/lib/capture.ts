@@ -1,6 +1,3 @@
-// VideoFrame API - Direct GPU frame access
-// 2-3x faster than drawImage + getImageData
-
 export interface CapturedFrame {
   pixels: Uint8Array;
   width: number;
@@ -13,55 +10,52 @@ export class FrameCapture {
   private useVideoFrame: boolean;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
-  
+
   constructor(video: HTMLVideoElement) {
     this.video = video;
-    
-    // Detect VideoFrame API support
-    this.useVideoFrame = 'VideoFrame' in window && 
+
+    this.useVideoFrame = 'VideoFrame' in window &&
                          typeof (video as any).requestVideoFrameCallback === 'function';
-    
+
     if (!this.useVideoFrame) {
       this.canvas = document.createElement('canvas');
       this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
     }
   }
-  
+
   async capture(): Promise<CapturedFrame | null> {
     if (this.video.readyState < 2) return null;
-    
+
     const width = this.video.videoWidth;
     const height = this.video.videoHeight;
-    
+
     if (!width || !height) return null;
-    
+
     if (this.useVideoFrame) {
       return this.captureWithVideoFrame(width, height);
     } else {
       return this.captureWithCanvas(width, height);
     }
   }
-  
+
   private async captureWithVideoFrame(width: number, height: number): Promise<CapturedFrame> {
-    // Use VideoFrame API - direct GPU access, no canvas round-trip
-    const frame = new (window as any).VideoFrame(this.video, { 
-      timestamp: performance.now() * 1000 
+
+    const frame = new (window as any).VideoFrame(this.video, {
+      timestamp: performance.now() * 1000
     });
-    
+
     try {
       const format = frame.format;
       const layout = frame.allocationLayout();
-      
-      // Allocate buffer for RGBA data
+
       const bytesNeeded = layout.totalBytes;
       const pixels = new Uint8Array(bytesNeeded);
-      
-      // Copy directly from GPU to buffer
-      await frame.copyTo(pixels, { 
+
+      await frame.copyTo(pixels, {
         rect: { x: 0, y: 0, width, height },
         layout: [{ offset: 0, stride: width * 4 }]
       });
-      
+
       return {
         pixels,
         width,
@@ -69,21 +63,21 @@ export class FrameCapture {
         timestamp: frame.timestamp
       };
     } finally {
-      frame.close(); // Important: release GPU resources
+      frame.close();
     }
   }
-  
+
   private captureWithCanvas(width: number, height: number): CapturedFrame {
-    // Fallback: traditional canvas method
+
     const canvas = this.canvas!;
     const ctx = this.ctx!;
-    
+
     if (canvas.width !== width) canvas.width = width;
     if (canvas.height !== height) canvas.height = height;
-    
+
     ctx.drawImage(this.video, 0, 0, width, height);
     const imageData = ctx.getImageData(0, 0, width, height);
-    
+
     return {
       pixels: new Uint8Array(imageData.data.buffer),
       width,
@@ -91,13 +85,12 @@ export class FrameCapture {
       timestamp: performance.now() * 1000
     };
   }
-  
+
   get isAccelerated(): boolean {
     return this.useVideoFrame;
   }
 }
 
-// Feature detection
 export function getCaptureCapabilities(): {
   videoFrame: boolean;
   webCodecs: boolean;
