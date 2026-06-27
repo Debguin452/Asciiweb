@@ -38,4 +38,4 @@ export function getWasmStatus() {
     functions: wasmModule ? Object.keys(wasmModule).filter(k => typeof wasmModule[k] === 'function') : []
   };
 }
-initWasm().catch(err =>
+initWasm().catch(err => console.error('[WASM] Auto-init failed:', err));
