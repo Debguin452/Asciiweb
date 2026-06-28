@@ -1,0 +1,15 @@
+{
+  "name": "asciiweb_wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "asciiweb_wasm_bg.wasm",
+    "asciiweb_wasm.js",
+    "asciiweb_wasm.d.ts"
+  ],
+  "main": "asciiweb_wasm.js",
+  "types": "asciiweb_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
