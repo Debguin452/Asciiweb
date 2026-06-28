@@ -1,0 +1,63 @@
+name: Build WASM module
+
+on:
+  push:
+    paths:
+      - "wasm-module/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            wasm-module/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('wasm-module/Cargo.lock') }}
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.92 --locked || cargo install wasm-bindgen-cli --version 0.2.92
+
+      - name: Run host-target tests
+        working-directory: wasm-module
+        run: cargo test --release
+
+      - name: Build wasm32
+        working-directory: wasm-module
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Generate JS bindings
+        working-directory: wasm-module
+        run: |
+          wasm-bindgen target/wasm32-unknown-unknown/release/asciiweb_wasm.wasm \
+            --out-dir pkg --target web
+
+      - name: Copy build output into the app
+        run: |
+          mkdir -p src/lib/wasm-pkg public/wasm
+          cp wasm-module/pkg/asciiweb_wasm.js wasm-module/pkg/asciiweb_wasm_bg.wasm \
+             wasm-module/pkg/asciiweb_wasm.d.ts wasm-module/pkg/asciiweb_wasm_bg.wasm.d.ts \
+             wasm-module/pkg/package.json src/lib/wasm-pkg/
+          cp wasm-module/pkg/asciiweb_wasm.js wasm-module/pkg/asciiweb_wasm_bg.wasm \
+             wasm-module/pkg/asciiweb_wasm.d.ts wasm-module/pkg/asciiweb_wasm_bg.wasm.d.ts \
+             wasm-module/pkg/package.json public/wasm/
+
+      - name: Commit updated WASM build
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/lib/wasm-pkg public/wasm
+          git diff --cached --quiet || git commit -m "Rebuild WASM module [skip ci]"
+          git push

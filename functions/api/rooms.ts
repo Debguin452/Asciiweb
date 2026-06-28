@@ -1,4 +1,3 @@
-// POST /api/rooms — create a new room, register host peer ID
 interface Env { ROOMS_KV: KVNamespace; }
 
 const CORS = {
@@ -31,7 +30,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     const code = genCode();
     const existing = await env.ROOMS_KV.get(`room:${code}`);
     if (!existing) {
-      await env.ROOMS_KV.put(`room:${code}`, JSON.stringify([peerId]), { expirationTtl: 3600 });
+      await env.ROOMS_KV.put(`room:${code}`, JSON.stringify([peerId]), { expirationTtl: 14400 });
       return json({ code, peerId });
     }
   }

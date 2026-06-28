@@ -75,7 +75,7 @@ export class WorkerManager {
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Canvas context failed');
 
-      ctx.putImageData(new ImageData(imageData, width, height), 0, 0);
+      ctx.putImageData(new ImageData(imageData as Uint8ClampedArray<ArrayBuffer>, width, height), 0, 0);
 
       const fakeVideo = {
         videoWidth: width,

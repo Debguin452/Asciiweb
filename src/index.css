@@ -483,7 +483,7 @@ html, body, #root {
   .toolbar { height: auto; min-height: 32px; padding: 3px 6px; }
   .main-layout { flex-direction: column; }
   .ascii-area { flex: 1; padding: 3px; }
-  .ascii-output { line-height: 1.1; }  /* font-size set by JS adaptively */
+  .ascii-output { line-height: 1.1; }
   .controls-panel { width: 100%; border-left: none; border-top: 1px solid var(--border); height: 220px; flex-shrink: 0; overflow-y: auto; }
   .panel-body { overflow-x: hidden; }
   .btn { min-height: 30px; padding: 5px 9px; }
@@ -542,13 +542,6 @@ html, body, #root {
 .crop-canvas { display: block; max-width: 100%; max-height: 100%; image-rendering: crisp-edges; }
 .crop-info { font-size: 10px; color: var(--fg-dim); text-align: center; letter-spacing: 0.04em; }
 
-
-
-/* ════════════════════════════════════════════════════════
-   CALL TAB — three clear screens, symmetric controls
-   ════════════════════════════════════════════════════════ */
-
-/* ── HOME SCREEN ─────────────────────────────────────── */
 .call-home {
   flex: 1;
   display: flex;
@@ -664,7 +657,6 @@ html, body, #root {
   width: 100%;
 }
 
-/* Shared code input */
 .call-code-input {
   width: 100%;
   max-width: 320px;
@@ -712,7 +704,6 @@ html, body, #root {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── WAITING / STARTING SCREEN ───────────────────────── */
 .call-waiting-screen {
   flex: 1;
   display: flex;
@@ -782,7 +773,6 @@ html, body, #root {
   color: var(--fg-faint);
 }
 
-/* Large segmented code display — easy to read aloud */
 .call-code-display {
   display: flex;
   gap: 6px;
@@ -866,7 +856,6 @@ html, body, #root {
 }
 .call-cancel-btn:hover { color: var(--danger); border-color: var(--danger-border); }
 
-/* ── IN-CALL SCREEN ──────────────────────────────────── */
 .call-active {
   flex: 1;
   display: flex;
@@ -875,7 +864,6 @@ html, body, #root {
   background: var(--bg);
 }
 
-/* ── WhatsApp-style call layout ─────────────────────────── */
 .call-panels-wa {
   flex: 1;
   position: relative;
@@ -884,7 +872,6 @@ html, body, #root {
   background: #000;
 }
 
-/* Remote fills the full background */
 .call-panel-wa-remote {
   position: absolute;
   inset: 0;
@@ -894,7 +881,6 @@ html, body, #root {
   overflow: hidden;
 }
 
-/* Local is a draggable PiP — position set via inline style */
 .call-panel-wa-local {
   position: absolute;
   width: 28%;
@@ -915,7 +901,6 @@ html, body, #root {
 }
 .call-panel-wa-local:active { cursor: grabbing; }
 
-/* ASCII pre for remote — fills parent absolutely, text starts top-left */
 .call-pre-wa {
   position: absolute;
   inset: 0;
@@ -928,7 +913,6 @@ html, body, #root {
   line-height: 1.1;
 }
 
-/* ASCII pre for PiP — fills pip box */
 .call-pre-pip {
   margin: 0;
   padding: 0;
@@ -949,7 +933,6 @@ html, body, #root {
   pointer-events: none;
 }
 
-/* Remote peer status badges (muted / cam-off icons) */
 .call-remote-badges {
   position: absolute;
   top: 10px;
@@ -963,6 +946,23 @@ html, body, #root {
   border-radius: 20px;
   color: #fff;
   opacity: 0.85;
+}
+
+.call-reconnect-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: color-mix(in srgb, #000 65%, transparent);
+  padding: 6px 14px;
+  border-radius: 20px;
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 0.02em;
 }
 
 .call-panel-waiting {
@@ -979,7 +979,6 @@ html, body, #root {
 }
 @keyframes pulse-opacity { 0%,100%{opacity:0.25} 50%{opacity:0.6} }
 
-/* ── BOTTOM CONTROL BAR — 5 equal circular buttons ───── */
 .call-bar {
   display: flex;
   align-items: center;
@@ -991,7 +990,6 @@ html, body, #root {
   flex-shrink: 0;
 }
 
-/* Every button is identical: 52×52 circle, icon + label */
 .call-circle-btn {
   display: flex;
   flex-direction: column;
@@ -1022,20 +1020,17 @@ html, body, #root {
   opacity: 0.75;
   white-space: nowrap;
   font-family: var(--font);
-  /* labels sit below the circle — don't resize it */
+
   position: absolute;
   bottom: -16px;
 }
 
-/* State variants — all same SIZE, different colour only */
 .call-circle-danger {
   background: var(--danger-bg);
   border-color: var(--danger-border);
   color: var(--danger);
 }
-/* Mic 3-state:
-   call-circle-active-mic  — normal (mic live, neutral appearance)
-   call-circle-muted       — amber (self-muted, clearly different from danger) */
+
 .call-circle-active-mic {
   border-color: var(--fg-dim);
 }
@@ -1056,10 +1051,8 @@ html, body, #root {
 }
 .call-circle-end:hover { background: #ff1a0e; border-color: #ff1a0e; color: #fff; }
 
-/* Give the bar enough bottom padding so labels don't clip */
 .call-bar { padding-bottom: 28px; }
 
-/* ── Mobile ──────────────────────────────────────────── */
 @media (max-width: 720px) {
   .call-panels { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
   .call-bar { gap: 12px; padding-bottom: 24px; }
@@ -1071,7 +1064,6 @@ html, body, #root {
   .call-big-btn { height: 50px; font-size: 13px; }
 }
 
-/* Call settings overlay */
 .call-settings-overlay {
   position: absolute;
   inset: 0;
@@ -1106,16 +1098,21 @@ html, body, #root {
   font-size: 12px;
   color: var(--fg);
 }
-.call-settings-row span:first-child { width: 36px; flex-shrink: 0; }
+.call-settings-row span:first-child { width: 64px; flex-shrink: 0; }
 .call-settings-row input[type=range] { flex: 1; }
 .call-settings-val {
-  width: 28px;
+  min-width: 28px;
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--fg-faint);
 }
+.call-settings-hint {
+  font-size: 11px;
+  color: var(--fg-faint);
+  opacity: 0.75;
+  line-height: 1.4;
+}
 
-/* ── Camera quality buttons ──────────────────────────────────────────────── */
 .cam-quality-bar { display: flex; gap: 3px; align-items: center; }
 .cam-quality-btn {
   font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
@@ -1130,7 +1127,6 @@ html, body, #root {
   color: var(--bg, #0a0a0a); background: var(--fg); border-color: var(--fg);
 }
 
-/* ── Call quality badge ──────────────────────────────────────────────────── */
 .call-quality-badge {
   display: inline-flex; align-items: center;
   font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
@@ -1138,4 +1134,20 @@ html, body, #root {
   border: 1px solid currentColor; background: transparent;
   user-select: none; cursor: default; flex-shrink: 0;
   font-family: inherit; transition: color 0.4s;
+}
+
+.call-peer-hung-up {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--fg-dim);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-align: center;
+  padding: 20px;
+  position: absolute;
+  inset: 0;
+  z-index: 4;
 }

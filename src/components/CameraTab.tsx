@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { processFrame, renderToString, resetTemporalSmoothing, type AsciiOptions, type AsciiFrame } from "../lib/ascii";
 import { saveLibraryItem, makeThumbnail, genId } from "../lib/library";
-import { exportGif, exportMp4, exportPng, exportJpeg, framesToText } from "../lib/export";
+import { exportGif, exportMp4, exportPng, exportJpeg, exportAtv, framesToText } from "../lib/export";
 import { makeFilename, triggerDownload, getExportBg } from "../types";
+import { analyzeFrame, type FrameAnalysis } from "../lib/atv/analysis";
 import ControlsPanel from "./ControlsPanel";
 
 interface Props {
@@ -26,16 +27,20 @@ const CAM_QUALITY: Record<CamQuality, { label: string; title: string; video: Med
 };
 
 const RESOLUTIONS = { "480p": { width: 640, height: 480, label: "480p" }, "720p": { width: 1280, height: 720, label: "720p" }, "1080p": { width: 1920, height: 1080, label: "1080p" } };
+const ATV_CAPTURE_INTERVAL_MS = 1000 / 15; // ATV analysis is heavier than ASCII rendering (blur + gradient passes), cap it independently
 
 export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onReset, onLibraryUpdated, exportFg, onExportFgChange }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const offscreen = useRef(document.createElement("canvas"));
+  const atvOffscreen = useRef(document.createElement("canvas"));
   const preRef = useRef<HTMLPreElement>(null);
   const areaRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
   const streamRef = useRef<MediaStream | null>(null);
   const optsRef = useRef(opts);
   const recordedRef = useRef<AsciiFrame[]>([]);
+  const atvAnalysesRef = useRef<FrameAnalysis[]>([]);
+  const lastAtvCaptureRef = useRef(0);
   const liveFpsRef = useRef(15);
   const fpsTimesRef = useRef<number[]>([]);
   const lastFrameRef = useRef<AsciiFrame | null>(null);
@@ -110,7 +115,16 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
       if (frame) lastFrameRef.current = frame;
       const { html, isColor } = result;
       if (isColor) pre.innerHTML = html; else pre.textContent = html;
-      if (stageRef.current === "recording" && frame) { recordedRef.current.push(frame); setRecCount(c => c + 1); }
+      if (stageRef.current === "recording" && frame) {
+        recordedRef.current.push(frame);
+        setRecCount(c => c + 1);
+        const lastAtv = lastAtvCaptureRef.current;
+        if (now - lastAtv >= ATV_CAPTURE_INTERVAL_MS) {
+          lastAtvCaptureRef.current = now;
+          const analysis = analyzeFrame(video, atvOffscreen.current, 160, 90, true);
+          if (analysis) atvAnalysesRef.current.push(analysis);
+        }
+      }
       fpsTimesRef.current.push(now);
       if (fpsTimesRef.current.length > 30) fpsTimesRef.current.shift();
       if (fpsTimesRef.current.length > 1) {
@@ -174,13 +188,25 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
   };
 
   const startCamera = async () => { setError(null); resetTemporalSmoothing(); lastRenderRef.current = 0; if (window.innerWidth > 720) setPanelOpen(true); try { await startCameraWithConstraints(); setStage("live"); } catch (e) { setError(e instanceof Error ? e.message : "Camera access denied"); } };
-  const stopCamera = () => { stopStream(); if (preRef.current) preRef.current.innerHTML = ""; recordedRef.current = []; setStage("idle"); setFps(0); setRecCount(0); setCapturedCount(0); fpsTimesRef.current = []; resetTemporalSmoothing(); };
-  const startRecording = () => { recordedRef.current = []; setRecCount(0); setStage("recording"); };
-  const captureFrame = () => { stopStream(); const frame = lastFrameRef.current; recordedRef.current = frame ? [frame] : []; setCapturedCount(recordedRef.current.length); setStage("choosing"); };
+  const stopCamera = () => { stopStream(); if (preRef.current) preRef.current.innerHTML = ""; recordedRef.current = []; atvAnalysesRef.current = []; setStage("idle"); setFps(0); setRecCount(0); setCapturedCount(0); fpsTimesRef.current = []; resetTemporalSmoothing(); };
+  const startRecording = () => { recordedRef.current = []; atvAnalysesRef.current = []; lastAtvCaptureRef.current = 0; setRecCount(0); setStage("recording"); };
+  const captureFrame = () => {
+    const video = videoRef.current;
+    const frame = lastFrameRef.current;
+    atvAnalysesRef.current = [];
+    if (video) {
+      const analysis = analyzeFrame(video, atvOffscreen.current, 160, 90, true);
+      if (analysis) atvAnalysesRef.current = [analysis];
+    }
+    stopStream();
+    recordedRef.current = frame ? [frame] : [];
+    setCapturedCount(recordedRef.current.length);
+    setStage("choosing");
+  };
   const stopAndChoose = () => { stopStream(); setCapturedCount(recordedRef.current.length); setStage("choosing"); };
-  const discard = () => { recordedRef.current = []; setRecCount(0); setCapturedCount(0); if (preRef.current) preRef.current.innerHTML = ""; setStage("idle"); };
+  const discard = () => { recordedRef.current = []; atvAnalysesRef.current = []; setRecCount(0); setCapturedCount(0); if (preRef.current) preRef.current.innerHTML = ""; setStage("idle"); };
 
-  const doExport = async (format: "txt" | "png" | "jpeg" | "gif" | "mp4") => {
+  const doExport = async (format: "txt" | "png" | "jpeg" | "gif" | "mp4" | "asp" | "asv") => {
     const frames = recordedRef.current; const isMulti = frames.length > 1; const o = optsRef.current; const bg = getExportBg(exportFg);
     setStage("exporting"); setExportStatus(`Generating ${format.toUpperCase()}…`);
     try {
@@ -189,7 +215,15 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
       else if (format === "jpeg") { const f = frames[0]; if (!f) throw new Error("No frame"); triggerDownload(await exportJpeg(f, fontSize, exportFg, bg, o.color), makeFilename("ascii", "jpg")); }
       else if (format === "gif") { if (!isMulti) throw new Error("No frames"); triggerDownload(await exportGif(frames, fontSize, exportFg, bg, o.color, liveFpsRef.current), makeFilename("ascii", "gif")); }
       else if (format === "mp4") { if (!isMulti) throw new Error("No frames"); const blob = await exportMp4(frames, fontSize, exportFg, bg, o.color, liveFpsRef.current); triggerDownload(blob, makeFilename("ascii", "mp4")); }
-      await saveToLibrary(frames, o); onLibraryUpdated(); setStage("idle"); recordedRef.current = []; setRecCount(0); setCapturedCount(0); if (preRef.current) preRef.current.innerHTML = "";
+      else if (format === "asp" || format === "asv") {
+        const analyses = atvAnalysesRef.current;
+        if (!analyses.length) throw new Error(`No frames captured for .${format}`);
+        const wantStill = format === "asp";
+        if (wantStill !== (analyses.length === 1)) throw new Error("Frame count doesn't match requested format");
+        const { blob, ext } = await exportAtv(analyses, { fps: 15, colorMode: o.color }, p => setExportStatus(`${p.phase}…`));
+        triggerDownload(blob, makeFilename("ascii", ext));
+      }
+      await saveToLibrary(frames, o); onLibraryUpdated(); setStage("idle"); recordedRef.current = []; atvAnalysesRef.current = []; setRecCount(0); setCapturedCount(0); if (preRef.current) preRef.current.innerHTML = "";
     } catch (err) { setExportStatus("Export failed"); setTimeout(() => setStage("choosing"), 2000); }
   };
 
@@ -270,7 +304,7 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
         </div>
       )}
       {stage === "exporting" && (<div className="export-overlay"><div className="export-status">{exportStatus}</div></div>)}
-      {stage === "choosing" && (<div className="choose-overlay"><h2>{isMulti ? `${capturedCount} frames` : "Captured"}</h2><div className="choose-actions"><button className="btn btn-primary" onClick={() => doExport(isMulti ? "gif" : "png")}>Export {isMulti ? "GIF" : "PNG"}</button><button className="btn btn-ghost" onClick={discard}>Discard</button></div></div>)}
+      {stage === "choosing" && (<div className="choose-overlay"><h2>{isMulti ? `${capturedCount} frames` : "Captured"}</h2><div className="choose-actions"><button className="btn btn-primary" onClick={() => doExport(isMulti ? "gif" : "png")}>Export {isMulti ? "GIF" : "PNG"}</button>{((isMulti && atvAnalysesRef.current.length > 1) || (!isMulti && atvAnalysesRef.current.length === 1)) && (<button className="btn btn-ghost" onClick={() => doExport(isMulti ? "asv" : "asp")} title="AsciiWeb's own compact format — smaller than GIF/MP4 for ASCII+color content">Export .{isMulti ? "asv" : "asp"}</button>)}<button className="btn btn-ghost" onClick={discard}>Discard</button></div></div>)}
     </div>
   );
 }

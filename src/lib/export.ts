@@ -1,4 +1,10 @@
 import type { AsciiFrame } from "./ascii";
+import type { FrameAnalysis } from "./atv/analysis";
+import { frameToTokens } from "./atv/analysis";
+import { medianCutQuantize, type PaletteColor } from "./atv/palette";
+import { buildGlyphTable, ALL_GLYPHS } from "./atv/glyphs";
+import { encodeAtv, type EncodeAtvOptions, type AtvEncodeProgress } from "./atv/codec";
+import type { AtvToken } from "./atv/motion";
 
 export function frameToText(frame: AsciiFrame): string {
   return frame.map(row => row.map(c => c.char).join("")).join("\n");
@@ -150,4 +156,70 @@ export async function exportMp4(frames: AsciiFrame[], fontSize: number, fg: stri
     };
     tick();
   });
+}
+
+export interface AtvExportResult {
+  blob: Blob;
+  ext: "asp" | "asv";
+}
+
+/**
+ * Encodes already-analyzed frames (from atv/analysis.ts' analyzeFrame,
+ * captured live during recording) using the project's ATV codec — glyph
+ * matching against edge/luminance features, motion compensation between
+ * frames, then RLE+Huffman entropy coding. Never stores raw pixels, so it
+ * beats GIF/MP4 for this kind of content by a wide margin.
+ *
+ * A single analyzed frame produces a .asp (still) file; more than one
+ * produces a .asv (video) file. Both share the same container format —
+ * the codec is the same either way — only the file's intended use differs.
+ */
+export async function exportAtv(
+  analyses: FrameAnalysis[],
+  opts: EncodeAtvOptions = {},
+  onProgress?: (p: AtvEncodeProgress) => void
+): Promise<AtvExportResult> {
+  if (!analyses.length) throw new Error("No frames to encode");
+  const { colorMode = true, paletteSize = 256, glyphSet = ALL_GLYPHS } = opts;
+
+  onProgress?.({ phase: "Building palette", progress: 0, total: 1 });
+
+  const sampleCount = Math.min(30, analyses.length);
+  const step = Math.max(1, Math.floor(analyses.length / sampleCount));
+  const samples: Uint8Array[] = [];
+  for (let i = 0; i < analyses.length; i += step) {
+    const a = analyses[i];
+    const n = a.width * a.height;
+    const arr = new Uint8Array(n * 4);
+    for (let j = 0; j < n; j++) {
+      arr[j * 4] = a.rArr[j];
+      arr[j * 4 + 1] = a.gArr[j];
+      arr[j * 4 + 2] = a.bArr[j];
+      arr[j * 4 + 3] = 255;
+    }
+    samples.push(arr);
+  }
+  const combinedLen = samples.reduce((s, p) => s + p.length, 0);
+  const combined = new Uint8Array(combinedLen);
+  let off = 0;
+  for (const p of samples) { combined.set(p, off); off += p.length; }
+
+  const palette: PaletteColor[] = colorMode
+    ? medianCutQuantize(combined, paletteSize, 8)
+    : [{ r: 255, g: 255, b: 255, id: 0 }];
+
+  const glyphs = buildGlyphTable(glyphSet);
+
+  onProgress?.({ phase: "Tokenizing frames", progress: 0, total: analyses.length });
+  const tokenFrames: Array<{ analysis: FrameAnalysis; tokens: AtvToken[][] }> = [];
+  for (let i = 0; i < analyses.length; i++) {
+    const tokens = frameToTokens(analyses[i], glyphs, palette, colorMode);
+    tokenFrames.push({ analysis: analyses[i], tokens });
+    if (i % 10 === 0) onProgress?.({ phase: "Tokenizing frames", progress: i, total: analyses.length });
+  }
+
+  const isStill = analyses.length === 1;
+  const data = await encodeAtv(tokenFrames, palette, glyphs, opts, onProgress);
+  const blob = new Blob([data as Uint8Array<ArrayBuffer>], { type: isStill ? "image/x-asp" : "video/x-asv" });
+  return { blob, ext: isStill ? "asp" : "asv" };
 }

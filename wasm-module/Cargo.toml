@@ -1,20 +1,33 @@
 [package]
 name = "asciiweb_wasm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wasm-bindgen = "0.2.92"
+wasm-bindgen = "=0.2.92"
+
+[features]
+default = []
+# Opt-in: real WASM SIMD128 grayscale path. Requires building with
+# RUSTFLAGS="-C target-feature=+simd128" (see .cargo/config.toml) and
+# requires the target browser/runtime to support the WASM SIMD proposal
+# (all current evergreen browsers do; very old WebViews may not).
+# IMPORTANT: verify visually after building — see wasm-module/README.md.
+simd = []
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-
-# Enable SIMD for WebAssembly
+panic = "abort"
 
 [package.metadata.wasm-pack.profile.release]
+# Left disabled, matching the previous config. wasm-opt occasionally has
+# version-compatibility issues with certain Binaryen/LLVM combinations;
+# since I can't build-test in this environment, I'm not changing a setting
+# I can't verify. Once you've confirmed a normal build works, try adding
+# wasm-opt = ["-O3"] yourself and diff the output size/behavior.
 wasm-opt = false

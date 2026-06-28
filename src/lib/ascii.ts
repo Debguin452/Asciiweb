@@ -1,4 +1,6 @@
-import { initWasm, getWasmModule, isWasmAvailable } from './wasm-wrapper';
+import {
+  isWasmAvailable, writePixelsToWasm, wasmProcessPipeline, readWasmGray, wasmQuantizeToCharIndices,
+} from './wasm-wrapper';
 
 export const DEFAULT_CHARSET = " .:-=+*#%@";
 
@@ -169,25 +171,22 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
   const invGamma = 1 / gamma;
 
   let wasmUsed = false;
-  const canUseWasm = isWasmAvailable() && !noiseReduction && !histEq && !localContrast && !dither && !brailleMode;
+  const canUseWasm = isWasmAvailable() && !noiseReduction && !histEq && !localContrast && !brailleMode && !(gradientDirs && edges); // WASM Sobel has no direction output
 
   if (canUseWasm) {
     try {
-      const wasm = getWasmModule();
-      const wasmResult = wasm.process_full_pipeline(
-        px, drawW, drawH,
-        brightness, contrast / 100, gamma,
-        edges
-      );
+      writePixelsToWasm(px, N);
+      wasmProcessPipeline(drawW, drawH, brightness, contrast / 100, gamma, edges);
+      gray.set(readWasmGray(N));
       for (let i = 0; i < N; i++) {
-        gray[i] = wasmResult[i];
         rArr[i] = px[i * 4];
         gArr[i] = px[i * 4 + 1];
         bArr[i] = px[i * 4 + 2];
       }
       wasmUsed = true;
-    } catch (err) {
-}
+    } catch {
+      wasmUsed = false;
+    }
   }
 
   if (!wasmUsed) {
@@ -216,11 +215,14 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
     if (ditherMode === "floyd") floydSteinberg(buf, drawW, drawH, nchars);
     else { const bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]; for (let y = 0; y < drawH; y++) for (let x = 0; x < drawW; x++) { const i = y * drawW + x; const th = (bayer[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * (255 / nchars); buf[i] = clamp(buf[i] + th); } }
     for (let i = 0; i < N; i++) { const lum = buf[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
+  } else if (wasmUsed) {
+    wasmQuantizeToCharIndices(N, nchars, threshold, invert);
+    charIdx.set(readWasmGray(N));
   } else {
     for (let i = 0; i < N; i++) { const lum = gray[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
   }
   if (temporalSmoothing) { if (!pool.smoothed) pool.smoothed = new Float32Array(N); const sm = pool.smoothed; for (let i = 0; i < N; i++) sm[i] = sm[i] * 0.6 + charIdx[i] * 0.4; for (let i = 0; i < N; i++) charIdx[i] = Math.round(sm[i]); }
-  if (gradientDirs) { for (let i = 0; i < N; i++) { if (pool.mag[i] > 40) { const deg = ((dir[i] * 180 / Math.PI) + 180) % 180; const li = deg < 22.5 || deg >= 157.5 ? 0 : deg < 67.5 ? 1 : deg < 112.5 ? 2 : 3; charIdx[i] = 0x4000 | li; } } }
+  if (gradientDirs) { const dir = pool.dir; for (let i = 0; i < N; i++) { if (pool.mag[i] > 40) { const deg = ((dir[i] * 180 / Math.PI) + 180) % 180; const li = deg < 22.5 || deg >= 157.5 ? 0 : deg < 67.5 ? 1 : deg < 112.5 ? 2 : 3; charIdx[i] = 0x4000 | li; } } }
   return { w: drawW, h: drawH, chars, nchars, brailleMode: false, blockMode: false, gradientDirs, color, threshold, invert };
 }
 

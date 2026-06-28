@@ -57,10 +57,10 @@ function paintRemote(frame: RemoteFrame, pre: HTMLPreElement) {
 function sampleColorFrame(
   video: HTMLVideoElement, canvas: HTMLCanvasElement,
   cols: number, rows: number, mirror: boolean
-): { html: string; colors: Uint8Array; w: number; h: number } | null {
+): { html: string; colors: Uint8Array; rgba: Uint8ClampedArray; w: number; h: number } | null {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || !vh) return null;
-  const iw = Math.min(cols, 120), ih = Math.min(rows, 68);
+  const iw = Math.max(1, cols), ih = Math.max(1, rows);
   if (canvas.width !== iw)  canvas.width  = iw;
   if (canvas.height !== ih) canvas.height = ih;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -91,7 +91,7 @@ function sampleColorFrame(
     if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
     lines[y] = parts.join("");
   }
-  return { html: lines.join("\n"), colors, w: iw, h: ih };
+  return { html: lines.join("\n"), colors, rgba: px, w: iw, h: ih };
 }
 
 const CALL_OPTS: Partial<AsciiOptions> = {
@@ -100,28 +100,61 @@ const CALL_OPTS: Partial<AsciiOptions> = {
   noiseReduction: false, localContrast: false, histEq: false,
 };
 
-async function apiCreate(peerId: string): Promise<string | null> {
-  try {
-    const r = await fetch("/api/rooms", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ peerId }),
-    });
-    return r.ok ? ((await r.json()) as { code?: string }).code ?? null : null;
-  } catch { return null; }
+function sleep(ms: number) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-async function apiJoin(code: string, peerId: string): Promise<string | null> {
+async function apiCreate(peerId: string, attempts = 3): Promise<string | null> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch("/api/rooms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ peerId }),
+      });
+      if (r.ok) {
+        const code = ((await r.json()) as { code?: string }).code;
+        if (code) return code;
+      } else if (r.status !== 503) {
+        return null;
+      }
+    } catch { /* retry */ }
+    if (i < attempts - 1) await sleep(400 * (i + 1));
+  }
+  return null;
+}
+
+async function apiUpdatePeerId(code: string, oldPeerId: string, newPeerId: string): Promise<void> {
   try {
-    const r = await fetch(`/api/rooms/${code}`, {
+    await fetch(`/api/rooms/${code}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ peerId }),
+      body: JSON.stringify({ peerId: newPeerId, replace: oldPeerId }),
     });
-    if (!r.ok) return null;
-    const d = await r.json() as { peers?: string[] };
-    return (d.peers ?? []).find(p => p !== peerId) ?? null;
-  } catch { return null; }
+  } catch { /* noop — reconnect will still try the stale id, which is fine if signaling recovers */ }
+}
+
+async function apiJoin(code: string, peerId: string, attempts = 4): Promise<string | null> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(`/api/rooms/${code}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ peerId }),
+      });
+      if (r.ok) {
+        const d = await r.json() as { peers?: string[] };
+        const host = (d.peers ?? []).find(p => p !== peerId);
+        if (host) return host;
+      } else if (r.status === 404) {
+        // Room may not have propagated to this edge node yet — worth a retry.
+      } else {
+        return null;
+      }
+    } catch { /* retry */ }
+    if (i < attempts - 1) await sleep(500 * (i + 1));
+  }
+  return null;
 }
 
 async function apiLeave(code: string, peerId: string) {
@@ -310,19 +343,32 @@ export default function CallTab({ opts, updateOpt }: Props) {
     Object.entries(CALL_OPTS).forEach(([k, v]) => updateOpt(k as keyof AsciiOptions, v as never));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const updateCallFontSize = useCallback(() => {
-    const o = optsRef.current;
-    const remCols = Math.max(10, o.asciiW || 60);
-    const remRows = Math.max(5,  o.asciiH || 34);
+  const MIN_FONT_PX = 5;
+  const CHAR_W_RATIO = 0.575, CHAR_H_RATIO = 1.1;
+  const MAX_CELLS = 12000;
 
+  const gridForPanel = (width: number, height: number) => {
+    let cols = Math.max(10, Math.floor(width  / (MIN_FONT_PX * CHAR_W_RATIO)));
+    let rows = Math.max(6,  Math.floor(height / (MIN_FONT_PX * CHAR_H_RATIO)));
+    const cells = cols * rows;
+    if (cells > MAX_CELLS) {
+      const scale = Math.sqrt(MAX_CELLS / cells);
+      cols = Math.max(10, Math.floor(cols * scale));
+      rows = Math.max(6,  Math.floor(rows * scale));
+    }
+    return { cols, rows };
+  };
+
+  const updateCallFontSize = useCallback(() => {
     const remEl = remoteAreaRef.current;
     if (remEl) {
       const { width, height } = remEl.getBoundingClientRect();
       if (width && height) {
-        const fsByW = width  / (remCols * 0.575);
-        const fsByH = height / (remRows * 1.1);
+        const { cols, rows } = gridForPanel(width, height);
+        const fsByW = width  / (cols * CHAR_W_RATIO);
+        const fsByH = height / (rows * CHAR_H_RATIO);
         const fs    = Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
-        remoteFitRef.current = { cols: remCols, rows: remRows };
+        remoteFitRef.current = { cols, rows };
         if (remotePreRef.current) {
           remotePreRef.current.style.fontSize   = fs + "px";
           remotePreRef.current.style.lineHeight = "1.1";
@@ -330,15 +376,15 @@ export default function CallTab({ opts, updateOpt }: Props) {
       }
     }
 
-    const PIP_COLS = 28, PIP_ROWS = 16;
     const locEl = localAreaRef.current;
     if (locEl) {
       const { width, height } = locEl.getBoundingClientRect();
       if (width && height) {
-        const fsByW = width  / (PIP_COLS * 0.575);
-        const fsByH = height / (PIP_ROWS * 1.1);
+        const { cols, rows } = gridForPanel(width, height);
+        const fsByW = width  / (cols * CHAR_W_RATIO);
+        const fsByH = height / (rows * CHAR_H_RATIO);
         const fs    = Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
-        fitRef.current = { cols: PIP_COLS, rows: PIP_ROWS };
+        fitRef.current = { cols, rows };
         if (localPreRef.current) {
           localPreRef.current.style.fontSize   = fs + "px";
           localPreRef.current.style.lineHeight = "1.1";
@@ -385,6 +431,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
         setCallStatus(s);
         if (s === "error")     setConnectErr(detail ?? "Connection failed");
         if (s === "connected") { setConnectErr(null); setScreen("in-call"); }
+        if (s === "reconnecting") setConnectErr(null);
       },
       onRemoteFrame: (f: RemoteFrame) => {
         setRemoteHere(true);
@@ -402,6 +449,10 @@ export default function CallTab({ opts, updateOpt }: Props) {
       onRemoteState: (state: RemoteState) => {
         setRemoteMuted(state.micMuted);
         setRemoteCamOff(state.camOff);
+      },
+      onIdChanged: (newId, oldId) => {
+        myIdRef.current = newId;
+        if (roomRef.current) apiUpdatePeerId(roomRef.current, oldId, newId).catch(() => {});
       },
     });
     callRef.current = mgr;
@@ -426,8 +477,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
       if (result) {
         pre.innerHTML = result.html;
         if (callRef.current?.isConnected) {
-          const dummy = new Uint16Array(result.w * result.h);
-          callRef.current.sendFrame(dummy as unknown as Uint8Array, result.w, result.h, BLOCK, result.colors);
+          callRef.current.sendColorFrame(result.rgba, result.w, result.h);
         }
         const now = performance.now();
         fpsT.current.push(now);
@@ -446,7 +496,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
           if (w > 0 && h > 0) {
             const N   = w * h;
             const raw = getPoolCharIdx();
-            callRef.current.sendFrame(
+            callRef.current.sendAsciiFrame(
               raw.length === N ? raw as unknown as Uint8Array : raw.slice(0, N) as unknown as Uint8Array,
               w, h, sortCharsetByDensity(o.charset || " .:-=+*#%@"), null
             );
@@ -526,7 +576,12 @@ export default function CallTab({ opts, updateOpt }: Props) {
       setStarting(false); return;
     }
 
-    const code = await apiCreate(myIdRef.current) ?? myIdRef.current;
+    const code = await apiCreate(myIdRef.current);
+    if (!code) {
+      setConnectErr("Couldn't create a room code. Check your connection and try again.");
+      setStarting(false); return;
+    }
+
     roomRef.current = code;
     modeRef.current = "host";
     setMode("host");
@@ -546,10 +601,13 @@ export default function CallTab({ opts, updateOpt }: Props) {
     }
 
     const hostId = await apiJoin(code, myIdRef.current);
-    if (hostId) callRef.current?.connectTo(hostId, streamRef.current);
-    else        callRef.current?.connectTo(code,   streamRef.current);
+    if (hostId) {
+      callRef.current?.connectTo(hostId, streamRef.current);
+      roomRef.current = code;
+    } else {
+      setConnectErr("Couldn't find that call code. Check it and try again.");
+    }
 
-    roomRef.current = code;
     setJoining(false);
   };
 
@@ -710,6 +768,12 @@ export default function CallTab({ opts, updateOpt }: Props) {
 
       <div className="call-panels-wa">
         <div ref={remoteAreaRef} className="call-panel-wa-remote">
+          {callStatus === "reconnecting" && (
+            <div className="call-reconnect-banner">
+              <span className="call-btn-spinner" />Reconnecting…
+            </div>
+          )}
+
           {peerHungUp ? (
             <div className="call-peer-hung-up">
               {IconEndCall}
@@ -757,24 +821,13 @@ export default function CallTab({ opts, updateOpt }: Props) {
         {showSettings && (
           <div className="call-settings-overlay" onClick={() => setShowSettings(false)}>
             <div className="call-settings-panel" onClick={e => e.stopPropagation()}>
-              <div className="call-settings-title">Grid Size</div>
+              <div className="call-settings-title">Detail Level</div>
               <div className="call-settings-row">
-                <span>Cols</span>
-                <input
-                  type="range" min="20" max="120" step="4"
-                  value={opts.asciiW}
-                  onChange={e => { updateOpt("asciiW", +e.target.value); setTimeout(updateCallFontSize, 50); }}
-                />
-                <span className="call-settings-val">{opts.asciiW}</span>
+                <span>Resolution</span>
+                <span className="call-settings-val">{fitRef.current.cols}×{fitRef.current.rows}</span>
               </div>
-              <div className="call-settings-row">
-                <span>Rows</span>
-                <input
-                  type="range" min="10" max="80" step="2"
-                  value={opts.asciiH}
-                  onChange={e => { updateOpt("asciiH", +e.target.value); setTimeout(updateCallFontSize, 50); }}
-                />
-                <span className="call-settings-val">{opts.asciiH}</span>
+              <div className="call-settings-hint">
+                Automatically maximized for your screen size.
               </div>
             </div>
           </div>

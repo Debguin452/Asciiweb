@@ -1,0 +1,18 @@
+# This file intentionally does NOT set target-feature=+simd128 by default.
+#
+# The "simd" Cargo feature (see ../Cargo.toml) is opt-in and unverified in
+# the environment that generated this code (no wasm32 toolchain was
+# available there to actually build and test it). To try it:
+#
+#   1. Uncomment the [target.wasm32-unknown-unknown] section below.
+#   2. Build with: wasm-pack build --target web --release --out-dir pkg --features simd
+#   3. Load the result in a real browser and visually compare grayscale/
+#      ASCII output against a build without --features simd, side by side,
+#      on a few different frames (plain face, high-contrast scene, solid
+#      color). They should look identical. If colors look shifted, banded,
+#      or the image looks corrupted, the SIMD path has a bug — file an
+#      issue or just drop --features simd, the scalar path is fully correct
+#      and is what ships without this feature.
+#
+# [target.wasm32-unknown-unknown]
+# rustflags = ["-C", "target-feature=+simd128"]

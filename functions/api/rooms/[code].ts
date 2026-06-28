@@ -1,4 +1,3 @@
-// GET/PUT/DELETE /api/rooms/:code — read, join, leave a room
 interface Env { ROOMS_KV: KVNamespace; }
 
 const CORS = {
@@ -25,7 +24,7 @@ async function getPeers(kv: KVNamespace, c: string): Promise<string[]> {
 }
 
 async function setPeers(kv: KVNamespace, c: string, peers: string[]): Promise<void> {
-  await kv.put(`room:${c}`, JSON.stringify(peers), { expirationTtl: 3600 });
+  await kv.put(`room:${c}`, JSON.stringify(peers), { expirationTtl: 14400 });
 }
 
 export const onRequestOptions: PagesFunction = async () =>
@@ -40,12 +39,23 @@ export const onRequestGet: PagesFunction<Env> = async ({ params, env }) => {
 
 export const onRequestPut: PagesFunction<Env> = async ({ request, params, env }) => {
   const c = code(params);
-  const body = await request.json().catch(() => null) as { peerId?: string } | null;
+  const body = await request.json().catch(() => null) as { peerId?: string; replace?: string } | null;
   const peerId = body?.peerId;
   if (!c || !peerId) return json({ error: "code and peerId required" }, 400);
-  const peers = await getPeers(env.ROOMS_KV, c);
+
+  let peers = await getPeers(env.ROOMS_KV, c);
   if (peers.length === 0) return json({ error: "Room not found" }, 404);
-  if (!peers.includes(peerId)) { peers.push(peerId); await setPeers(env.ROOMS_KV, c, peers); }
+
+  if (body?.replace && peers.includes(body.replace)) {
+    // Peer reconnected with a fresh signaling ID (e.g. after a network drop
+    // forced PeerJS to re-register) — swap it in place so the other side's
+    // next reconnect attempt resolves to the live ID.
+    peers = peers.map(p => (p === body.replace ? peerId : p));
+  } else if (!peers.includes(peerId)) {
+    peers.push(peerId);
+  }
+
+  await setPeers(env.ROOMS_KV, c, peers);
   return json({ code: c, peers });
 };
 
