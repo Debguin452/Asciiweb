@@ -14,18 +14,42 @@ export function framesToText(frames: AsciiFrame[]): string {
   return frames.map((f, i) => (i > 0 ? "\n---\n" : "") + frameToText(f)).join("");
 }
 
-export function frameToCanvas(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean): HTMLCanvasElement {
+// Waits for the JetBrains Mono web font to actually finish loading before
+// anything draws text with it. Canvas text doesn't wait for webfonts the
+// way DOM text does — if a PNG/JPEG export ran before the font finished
+// loading (easy to hit on a fast "capture, then immediately export" click,
+// or on a slow connection), ctx.font silently fell back to the generic
+// "monospace" face. That's a different glyph shape/spacing than what the
+// on-screen preview uses, so exports could look subtly (or not so subtly)
+// off from what was shown. document.fonts is unavailable in a few older
+// browsers, so this degrades to "draw immediately" there rather than hang.
+async function ensureFontReady(): Promise<void> {
+  try {
+    if (document.fonts?.ready) await document.fonts.ready;
+  } catch { /* noop — draw with whatever's available */ }
+}
+
+/**
+ * `scale` supersamples the canvas (default 2x): each character cell is
+ * rasterized at `scale`x its on-screen size, then downscaled implicitly by
+ * the browser when displayed/encoded — same trick as devicePixelRatio
+ * rendering. Plain 1x canvas text at typical export font sizes (8-14px)
+ * reads noticeably soft/aliased compared to the DOM-rendered <pre> preview;
+ * 2x gets export output close to what the preview actually looks like.
+ */
+export function frameToCanvas(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean, scale = 2): HTMLCanvasElement {
   const cols = frame[0]?.length ?? 80;
   const rows = frame.length;
-  const cw = Math.ceil(fontSize * 0.6);
-  const ch = Math.ceil(fontSize * 1.15);
+  const cw = Math.ceil(fontSize * 0.6 * scale);
+  const ch = Math.ceil(fontSize * 1.15 * scale);
   const canvas = document.createElement("canvas");
   canvas.width = cols * cw;
   canvas.height = rows * ch;
   const ctx = canvas.getContext("2d")!;
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.font = `${fontSize}px "JetBrains Mono", monospace`;
+  ctx.font = `${Math.round(fontSize * scale)}px "JetBrains Mono", monospace`;
+  ctx.textBaseline = "alphabetic";
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < (frame[y]?.length ?? 0); x++) {
       const cell = frame[y][x];
@@ -37,14 +61,16 @@ export function frameToCanvas(frame: AsciiFrame, fontSize: number, fg: string, b
   return canvas;
 }
 
-export function exportPng(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean): Promise<Blob> {
+export async function exportPng(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean): Promise<Blob> {
+  await ensureFontReady();
   const canvas = frameToCanvas(frame, fontSize, fg, bg, color);
   return new Promise((resolve, reject) => {
     canvas.toBlob(b => b ? resolve(b) : reject(new Error("PNG export failed")), "image/png");
   });
 }
 
-export function exportJpeg(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean): Promise<Blob> {
+export async function exportJpeg(frame: AsciiFrame, fontSize: number, fg: string, bg: string, color: boolean): Promise<Blob> {
+  await ensureFontReady();
   const canvas = frameToCanvas(frame, fontSize, fg, bg, color);
   return new Promise((resolve, reject) => {
     canvas.toBlob(b => b ? resolve(b) : reject(new Error("JPEG export failed")), "image/jpeg", 0.92);

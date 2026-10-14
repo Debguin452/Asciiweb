@@ -24,14 +24,22 @@ export interface CallQualityStep {
   keyframeInterval: number;
   targetFps: number;
   maxFrameSize: number; // bytes; a single frame over this is skipped rather than sent
+  resScale: number; // multiplier applied to the capture grid (cols/rows) at this level
 }
 
+// resScale lets congestion shrink the actual captured grid, not just the frame
+// rate / drop threshold. Previously only fps and the drop-above-this-size
+// threshold responded to network conditions — the capture resolution itself
+// was fixed, so a congested link either sent big, slow frames or silently
+// dropped them outright (while an always-full-size keyframe still went out
+// every keyframeInterval regardless, since dispatch() never size-gates
+// keyframes). Scaling resolution down with quality keeps keyframes cheap too.
 const QUALITY_STEPS: Record<CallQualityLevel, CallQualityStep> = {
-  low:    { keyframeInterval: 90, targetFps: 12, maxFrameSize: 4000  },
-  medium: { keyframeInterval: 60, targetFps: 24, maxFrameSize: 8000  },
-  high:   { keyframeInterval: 45, targetFps: 36, maxFrameSize: 16000 },
-  ultra:  { keyframeInterval: 30, targetFps: 48, maxFrameSize: 32000 },
-  max:    { keyframeInterval: 24, targetFps: 60, maxFrameSize: 65000 },
+  low:    { keyframeInterval: 90, targetFps: 12, maxFrameSize: 4000,  resScale: 0.45 },
+  medium: { keyframeInterval: 60, targetFps: 24, maxFrameSize: 8000,  resScale: 0.65 },
+  high:   { keyframeInterval: 45, targetFps: 36, maxFrameSize: 16000, resScale: 0.85 },
+  ultra:  { keyframeInterval: 30, targetFps: 48, maxFrameSize: 32000, resScale: 1.0  },
+  max:    { keyframeInterval: 24, targetFps: 60, maxFrameSize: 65000, resScale: 1.0  },
 };
 
 const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra", "max"];
