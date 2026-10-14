@@ -192,9 +192,17 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
   const startRecording = () => { recordedRef.current = []; atvAnalysesRef.current = []; lastAtvCaptureRef.current = 0; setRecCount(0); setStage("recording"); };
   const captureFrame = () => {
     const video = videoRef.current;
-    const frame = lastFrameRef.current;
     atvAnalysesRef.current = [];
-    if (video) {
+    // Compute the frame fresh from the live video right now, instead of
+    // relying on lastFrameRef — that ref is only ever populated by
+    // renderLoop while stage === "recording" (see line ~113-115), so when
+    // this is called from the "live" preview (the normal single-photo
+    // "Capture" button) it was always null, silently producing a 0-frame
+    // capture and a "No frame" error on export.
+    let frame: AsciiFrame | null = null;
+    if (video && video.readyState >= 2) {
+      const captureOpts: AsciiOptions = { ...optsRef.current, asciiW: fitRef.current.cols, asciiH: fitRef.current.rows };
+      frame = processFrame(video, offscreen.current, captureOpts, true);
       const analysis = analyzeFrame(video, atvOffscreen.current, 160, 90, true);
       if (analysis) atvAnalysesRef.current = [analysis];
     }

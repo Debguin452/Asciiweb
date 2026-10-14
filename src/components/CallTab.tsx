@@ -600,6 +600,23 @@ export default function CallTab({ opts, updateOpt }: Props) {
       modeRef.current = "guest"; setMode("guest"); setScreen("starting");
     }
 
+    // myIdRef is only set once the signaling peer finishes connecting
+    // (see initMgr's mgr.start().then(...)), which is async and not
+    // guaranteed to have resolved yet — e.g. pasting a code and hitting
+    // Join right after the page loads. Without this wait, apiJoin was
+    // sent with peerId: "", the API rejected it (400), and the guest saw
+    // a misleading "Couldn't find that call code" even for a valid code.
+    let waited = 0;
+    while (!myIdRef.current && waited < 10000) {
+      await new Promise(r => setTimeout(r, 200));
+      waited += 200;
+    }
+    if (!myIdRef.current) {
+      setConnectErr("Connection system failed. Check internet.");
+      setJoining(false);
+      return;
+    }
+
     const hostId = await apiJoin(code, myIdRef.current);
     if (hostId) {
       callRef.current?.connectTo(hostId, streamRef.current);

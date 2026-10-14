@@ -60,14 +60,24 @@ export default function ImageTab({ opts, updateOpt, fontSize, setFontSize, onRes
       const frame = editItem.frames[0];
       if (!frame) return;
       const colorFrame = opts.color ? editItem.colorFrames?.[0] : undefined;
-      const html = frame.map((row, y) =>
+      const mappedFrame: AsciiFrame = frame.map((row, y) =>
         row.map((ci, x) => {
           const ni = srcLen > 1 ? Math.round((ci / (srcLen - 1)) * (dstLen - 1)) : 0;
-          const ch = dstCharset[Math.min(ni, dstLen - 1)] ?? " ";
-          if (ch === " ") return "\u00a0";
+          const idx = Math.min(ni, dstLen - 1);
           const c = colorFrame?.[y]?.[x];
-          if (c) return `<span style="color:rgb(${c[0]},${c[1]},${c[2]})">${ch}</span>`;
-          return ch;
+          return { char: dstCharset[idx] ?? " ", charIdx: idx, r: c?.[0] ?? 0, g: c?.[1] ?? 0, b: c?.[2] ?? 0 };
+        })
+      );
+      // Keep lastFrameRef in sync here too \u2014 PNG/JPG export and "Save to
+      // Library" both read from it, and previously this edit-mode branch
+      // never set it, so exporting straight from an edited library item
+      // would silently fail ("No frame").
+      lastFrameRef.current = mappedFrame;
+      const html = mappedFrame.map(row =>
+        row.map(cell => {
+          if (cell.char === " ") return "\u00a0";
+          if (cell.r || cell.g || cell.b) return `<span style="color:rgb(${cell.r},${cell.g},${cell.b})">${cell.char}</span>`;
+          return cell.char;
         }).join("")
       ).join("\n");
       pre.innerHTML = html;
