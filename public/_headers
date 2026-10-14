@@ -2,12 +2,34 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Resource-Policy: cross-origin
-  Cache-Control: public, max-age=31536000, immutable
   X-Content-Type-Options: nosniff
 
 /*.wasm
   Content-Type: application/wasm
+
+# Vite's own JS/CSS bundle output lives under /assets/ with a content hash
+# baked into the filename (e.g. index-a1b2c3.js) — a new build always gets
+# a new URL, so these alone are safe to cache for a year as immutable.
+/assets/*
   Cache-Control: public, max-age=31536000, immutable
 
-/*.js
-  Cache-Control: public, max-age=31536000, immutable
+# Everything else (index.html, sw.js, manifest.json, /wasm/*.js, /wasm/*.wasm,
+# watch.html) is served at a fixed, unhashed URL that changes in place on
+# every deploy. The previous rule cached these immutably for a year too,
+# which — together with the old cache-first service worker — meant a
+# redeploy (a PNG-export fix, a WASM rebuild, a call.ts fix) could be
+# invisible to anyone who had already loaded the site, for up to a year.
+/index.html
+  Cache-Control: no-cache
+
+/sw.js
+  Cache-Control: no-cache
+
+/manifest.json
+  Cache-Control: no-cache
+
+/wasm/*
+  Cache-Control: no-cache
+
+/watch.html
+  Cache-Control: no-cache
