@@ -298,8 +298,9 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const streamRef     = useRef<MediaStream | null>(null);
   const callRef       = useRef<CallManager | null>(null);
   const optsRef       = useRef(opts);
-  const fitRef        = useRef({ cols: 60, rows: 34 });
   const remoteFitRef  = useRef({ cols: 60, rows: 34 });
+  const sendFitRef    = useRef({ cols: 60, rows: 34 }); // actual capture/send grid — see renderLoop
+  const qualityScaleRef = useRef(1);
   const myIdRef       = useRef("");
   const roomRef       = useRef("");
   const modeRef       = useRef<Mode>(null);
@@ -359,37 +360,42 @@ export default function CallTab({ opts, updateOpt }: Props) {
     return { cols, rows };
   };
 
+  // Font size that fits exactly `cols`x`rows` characters into `el`'s current
+  // box. Used both for our own small self-view PIP (fitting a — possibly
+  // much larger — capture grid into a tiny box means a small font, which is
+  // fine, it's just a thumbnail) and, per-frame, for the remote peer's pane
+  // (fitting *their* actual sent resolution, whatever it is).
+  const fontSizeForGrid = (el: HTMLElement | null, cols: number, rows: number): number => {
+    if (!el || !cols || !rows) return 8;
+    const { width, height } = el.getBoundingClientRect();
+    if (!width || !height) return 8;
+    const fsByW = width  / (cols * CHAR_W_RATIO);
+    const fsByH = height / (rows * CHAR_H_RATIO);
+    return Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
+  };
+
   const updateCallFontSize = useCallback(() => {
+    // remoteFitRef is sized to *our own* remote-viewing panel — a reasonable
+    // stand-in for "how much detail is actually useful", and the baseline
+    // the outgoing capture resolution is built from (see renderLoop). It's
+    // no longer used to set remotePreRef's font size directly: the frames
+    // we receive carry their own width/height (the sender's resolution,
+    // which can legitimately differ from ours — different screen size, or
+    // scaled down under congestion), so that's sized per-frame instead
+    // (see onRemoteFrame below) to avoid a resolution/display mismatch.
     const remEl = remoteAreaRef.current;
     if (remEl) {
       const { width, height } = remEl.getBoundingClientRect();
-      if (width && height) {
-        const { cols, rows } = gridForPanel(width, height);
-        const fsByW = width  / (cols * CHAR_W_RATIO);
-        const fsByH = height / (rows * CHAR_H_RATIO);
-        const fs    = Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
-        remoteFitRef.current = { cols, rows };
-        if (remotePreRef.current) {
-          remotePreRef.current.style.fontSize   = fs + "px";
-          remotePreRef.current.style.lineHeight = "1.1";
-        }
-      }
+      if (width && height) remoteFitRef.current = gridForPanel(width, height);
     }
 
-    const locEl = localAreaRef.current;
-    if (locEl) {
-      const { width, height } = locEl.getBoundingClientRect();
-      if (width && height) {
-        const { cols, rows } = gridForPanel(width, height);
-        const fsByW = width  / (cols * CHAR_W_RATIO);
-        const fsByH = height / (rows * CHAR_H_RATIO);
-        const fs    = Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
-        fitRef.current = { cols, rows };
-        if (localPreRef.current) {
-          localPreRef.current.style.fontSize   = fs + "px";
-          localPreRef.current.style.lineHeight = "1.1";
-        }
-      }
+    // The local PIP box just mirrors whatever grid we're actually sending
+    // (sendFitRef, computed in renderLoop) shrunk to fit its small frame.
+    if (localPreRef.current) {
+      const { cols, rows } = sendFitRef.current;
+      const fs = fontSizeForGrid(localAreaRef.current, cols, rows);
+      localPreRef.current.style.fontSize   = fs + "px";
+      localPreRef.current.style.lineHeight = "1.1";
     }
   }, []);
 
@@ -436,7 +442,17 @@ export default function CallTab({ opts, updateOpt }: Props) {
       onRemoteFrame: (f: RemoteFrame) => {
         setRemoteHere(true);
         setPeerHungUp(false);
-        if (remotePreRef.current) paintRemote(f, remotePreRef.current);
+        if (remotePreRef.current) {
+          // Size to the frame's *actual* w/h, not an assumption of what the
+          // sender used — their screen size (and, now, their current quality
+          // level) can genuinely differ from ours, and sizing off a stale
+          // guess is what produced the blown-up, blocky look: a low-res
+          // frame stretched via a font size computed for a higher-res one.
+          const fs = fontSizeForGrid(remoteAreaRef.current, f.w, f.h);
+          remotePreRef.current.style.fontSize   = fs + "px";
+          remotePreRef.current.style.lineHeight = "1.1";
+          paintRemote(f, remotePreRef.current);
+        }
       },
       onRemoteHangup: () => {
         setRemoteHere(false);
@@ -449,6 +465,13 @@ export default function CallTab({ opts, updateOpt }: Props) {
       onRemoteState: (state: RemoteState) => {
         setRemoteMuted(state.micMuted);
         setRemoteCamOff(state.camOff);
+      },
+      onQualityChange: (_level, step) => {
+        // Drives the actual capture/send resolution (see renderLoop) —
+        // previously only fps and the drop-above-this-size threshold
+        // responded to network conditions, so a congested link just sent
+        // large, slow frames (or dropped them) at a fixed resolution.
+        qualityScaleRef.current = step.resScale;
       },
       onIdChanged: (newId, oldId) => {
         myIdRef.current = newId;
@@ -470,7 +493,25 @@ export default function CallTab({ opts, updateOpt }: Props) {
 
     const isColor  = colorModeRef.current;
     const isMirror = facingRef.current === "user";
-    const pip      = fitRef.current;
+
+    // Capture/send resolution: baselined on our own remote-viewing panel
+    // size (a reasonable stand-in for how much detail is worth sending),
+    // scaled down under congestion by the live CallManager quality level.
+    // This used to be fitRef — the tiny local self-view PIP's own grid —
+    // which had nothing to do with how big the recipient's screen is; that
+    // was the main cause of blocky, low-detail video (see onQualityChange
+    // and onRemoteFrame above for the other half of this fix).
+    const base  = remoteFitRef.current;
+    const scale = qualityScaleRef.current;
+    const cols  = Math.max(14, Math.round(base.cols * scale));
+    const rows  = Math.max(8,  Math.round(base.rows * scale));
+    if (cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) {
+      sendFitRef.current = { cols, rows };
+      const fs = fontSizeForGrid(localAreaRef.current, cols, rows);
+      pre.style.fontSize   = fs + "px";
+      pre.style.lineHeight = "1.1";
+    }
+    const pip = sendFitRef.current;
 
     if (isColor) {
       const result = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
@@ -840,11 +881,11 @@ export default function CallTab({ opts, updateOpt }: Props) {
             <div className="call-settings-panel" onClick={e => e.stopPropagation()}>
               <div className="call-settings-title">Detail Level</div>
               <div className="call-settings-row">
-                <span>Resolution</span>
-                <span className="call-settings-val">{fitRef.current.cols}×{fitRef.current.rows}</span>
+                <span>Sending at</span>
+                <span className="call-settings-val">{sendFitRef.current.cols}×{sendFitRef.current.rows}</span>
               </div>
               <div className="call-settings-hint">
-                Automatically maximized for your screen size.
+                Automatically scaled to your screen and current connection quality.
               </div>
             </div>
           </div>
