@@ -127,7 +127,6 @@ function unpackFrames(
   const nchars = charset.length;
   const bpc = bitsNeeded(nchars);
   const bytesPerIndexFrame = Math.ceil((asciiW * asciiH * bpc) / 8);
-  const bytesPerColorFrame = hasColor ? asciiW * asciiH * 3 : 0;
   const mask = (1 << bpc) - 1;
 
   const frames: number[][][] = [];
@@ -243,7 +242,7 @@ export async function decodeAsvOrAsp(data: Uint8Array): Promise<DecodedAsv> {
   let p = 4;
 
   const metaLen = (raw[p++] << 8) | raw[p++];
-  const { meta, p: p2 } = decodeMetadata(raw, p);
+  const { meta } = decodeMetadata(raw, p);
   p = p + metaLen;
 
   let frameCount = 1;

@@ -1,24 +1,7 @@
-interface WasmExports {
-  memory: WebAssembly.Memory;
-  alloc_buffers: (maxPixels: number) => void;
-  pixels_ptr: () => number;
-  gray_ptr: () => number;
-  color_idx_ptr: () => number;
-  packed_ptr: () => number;
-  delta_ptr: () => number;
-  palette_ptr: () => number;
-  process_pipeline: (w: number, h: number, brightness: number, contrast: number, gamma: number, applySobel: boolean) => void;
-  quantize_to_char_indices: (n: number, nchars: number, threshold: number, invert: boolean) => void;
-  map_to_palette: (w: number, h: number) => void;
-  generate_palette: () => void;
-  delta_color_indices: (n: number, breakevenRatio: number) => number;
-  delta_char_indices: (n: number, breakevenRatio: number) => number;
-  commit_color_frame: (n: number) => void;
-  commit_char_frame: (n: number) => void;
-  reset_delta_history: () => void;
-  pack_char_indices: (n: number, bitsPerChar: number) => number;
-  greet: () => string;
-}
+import init, * as glue from './wasm-pkg/asciiweb_wasm.js';
+import wasmUrl from './wasm-pkg/asciiweb_wasm_bg.wasm?url';
+
+type WasmExports = typeof glue & { memory: WebAssembly.Memory };
 
 let wasmModule: WasmExports | null = null;
 let wasmAvailable = false;
@@ -33,22 +16,19 @@ export async function initWasm(): Promise<void> {
   if (wasmInitPromise) return wasmInitPromise;
   wasmInitPromise = (async () => {
     try {
-      const wasmPath = '/wasm/asciiweb_wasm.js';
-      const wasm = await import(/* @vite-ignore */ wasmPath);
-      if (wasm.default && typeof wasm.default === 'function') {
-        await wasm.default('/wasm/asciiweb_wasm_bg.wasm');
-      }
-      wasmModule = wasm as WasmExports;
-      wasmModule.alloc_buffers(MAX_FRAME_PIXELS); // throws + falls back cleanly if this is a pre-rewrite .wasm binary
+      // The glue module keeps `memory` private; it is only exposed on init()'s return value.
+      const out = await init(wasmUrl);
+      const memory = (out as unknown as { memory: WebAssembly.Memory }).memory;
+      if (!memory) throw new Error('wasm memory export missing');
+      wasmModule = Object.assign({}, glue, { memory }) as unknown as WasmExports;
+      wasmModule.alloc_buffers(MAX_FRAME_PIXELS);
       allocatedCapacity = MAX_FRAME_PIXELS;
       wasmAvailable = true;
       wasmReady = true;
     } catch (err) {
       wasmError = err instanceof Error ? err.message : String(err);
       wasmAvailable = false;
-      if (wasmError.includes('is not a function')) {
-        console.warn('[asciiweb] Loaded .wasm binary is missing expected exports — rebuild wasm-module/ to enable WASM acceleration. Falling back to JS.');
-      }
+      console.warn('[asciiweb] WASM unavailable, using JS fallback:', wasmError);
     }
   })();
   return wasmInitPromise;

@@ -245,7 +245,7 @@ export async function exportAtv(
   }
 
   const isStill = analyses.length === 1;
-  const data = await encodeAtv(tokenFrames, palette, glyphs, opts, onProgress);
+  const data = await encodeAtv(tokenFrames, palette, opts, onProgress);
   const blob = new Blob([data as Uint8Array<ArrayBuffer>], { type: isStill ? "image/x-asp" : "video/x-asv" });
   return { blob, ext: isStill ? "asp" : "asv" };
 }

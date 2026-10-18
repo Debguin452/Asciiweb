@@ -152,7 +152,7 @@ interface CoreResult { w: number; h: number; chars: string; nchars: number; brai
 
 function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean, crop?: { x: number; y: number; w: number; h: number }): CoreResult | null {
   const { w: sw, h: sh } = getSourceDimensions(source); if (!sw || !sh) return null;
-  const { asciiW, asciiH, brightness, contrast, threshold, gamma, invert, color, edges, gradientDirs, dither, ditherMode, noiseReduction, localContrast, histEq, charset, brailleMode, blockMode, temporalSmoothing, charDensitySort } = opts;
+  const { asciiW, asciiH, brightness, contrast, threshold, gamma, invert, color, edges, gradientDirs, dither, ditherMode, noiseReduction, localContrast, histEq, charset, brailleMode, temporalSmoothing, charDensitySort } = opts;
   const srcX = crop?.x ?? 0, srcY = crop?.y ?? 0, srcW = crop?.w ?? sw, srcH = crop?.h ?? sh;
   const aspect = srcW / srcH, charAspect = 0.5;
   let drawW = asciiW, drawH = Math.round(asciiW / aspect * charAspect);
@@ -178,11 +178,7 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
       writePixelsToWasm(px, N);
       wasmProcessPipeline(drawW, drawH, brightness, contrast / 100, gamma, edges);
       gray.set(readWasmGray(N));
-      for (let i = 0; i < N; i++) {
-        rArr[i] = px[i * 4];
-        gArr[i] = px[i * 4 + 1];
-        bArr[i] = px[i * 4 + 2];
-      }
+      if (color) for (let i = 0, o = 0; i < N; i++, o += 4) { rArr[i] = px[o]; gArr[i] = px[o + 1]; bArr[i] = px[o + 2]; }
       wasmUsed = true;
     } catch {
       wasmUsed = false;
@@ -229,7 +225,7 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
 const LINE_CHARS = ["-", "/", "|", "\\"];
 const _rgbCache = new Map<number, string>();
 function rgbStr(r: number, g: number, b: number): string { const k = (r << 16) | (g << 8) | b; let s = _rgbCache.get(k); if (!s) { s = `rgb(${r},${g},${b})`; if (_rgbCache.size < 32768) _rgbCache.set(k, s); } return s; }
-function escChar(s: string): string { return s === "&" ? "&" : s === "<" ? "<" : s === ">" ? ">" : s; }
+function escChar(s: string): string { return s === "&" ? "&amp;" : s === "<" ? "&lt;" : s === ">" ? "&gt;" : s; }
 
 export function renderToString(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean, mode: "html" | "text", crop?: { x: number; y: number; w: number; h: number }): { html: string; isColor: boolean } | null {
   const core = runCore(source, offscreen, opts, mirror, crop);
