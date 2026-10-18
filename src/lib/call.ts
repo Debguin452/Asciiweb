@@ -84,14 +84,25 @@ export class CallManager {
   private prevSentColorIdx: Uint8Array | null = null;
   private prevRecvFrame: RemoteFrame | null = null;
   private frameCount = 0;
-  private keyframeInterval = QUALITY_STEPS.ultra.keyframeInterval;
+  // Starting at "ultra" (48fps, full resolution, the biggest frames) meant
+  // every call began by blasting the most demanding setting a phone's
+  // single-threaded JS + data channel could possibly sustain, before any
+  // congestion signal existed to say otherwise. That's backwards — it
+  // guarantees an overload spike (dropped/late frames, CPU-starved
+  // encoding) right at connect, which is also exactly when adaptQuality()
+  // has the least data (consecutiveGood/Bad both start at 0) to react
+  // quickly. Starting at "medium" and letting adaptQuality() ramp UP once
+  // conditions are confirmed good (2 consecutive healthy checks) is far
+  // more stable than starting high and only reacting after things are
+  // already struggling.
+  private keyframeInterval = QUALITY_STEPS.medium.keyframeInterval;
   private lastSentAt = 0;
-  private targetFps = QUALITY_STEPS.ultra.targetFps;
-  private maxFrameSize = QUALITY_STEPS.ultra.maxFrameSize;
+  private targetFps = QUALITY_STEPS.medium.targetFps;
+  private maxFrameSize = QUALITY_STEPS.medium.maxFrameSize;
 
   private receivedKeyframe = false;
 
-  private qualityLevel: CallQualityLevel = "ultra";
+  private qualityLevel: CallQualityLevel = "medium";
   private recentSends = 0;
   private recentDrops = 0;
   private recentLatencies: number[] = [];
