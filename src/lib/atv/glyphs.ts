@@ -82,7 +82,6 @@ function computeGlyphFeature(ch: string, gray: Float32Array, W: number, H: numbe
 
   for (let y = 1; y < H - 1; y++) {
     for (let x = 1; x < W - 1; x++) {
-      const i = y * W + x;
       let mn = 1, mx = 0;
       for (let ky = -1; ky <= 1; ky++)
         for (let kx = -1; kx <= 1; kx++) {
@@ -105,7 +104,6 @@ function computeGlyphFeature(ch: string, gray: Float32Array, W: number, H: numbe
 }
 
 export function buildGlyphTable(charset: string): GlyphFeature[] {
-  const cacheKey = charset;
   const cached: GlyphFeature[] = [];
   const missing: string[] = [];
 

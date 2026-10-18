@@ -1,4 +1,4 @@
-import { buildGlyphTable, selectGlyph, ALL_GLYPHS, EDGE_GLYPHS, type GlyphFeature, type CellContext } from "./glyphs";
+import { selectGlyph, type GlyphFeature, type CellContext } from "./glyphs";
 import { type PaletteColor, buildPaletteLookup } from "./palette";
 import type { AtvToken } from "./motion";
 

@@ -1,11 +1,10 @@
-import { type PaletteColor, type PaletteSize, serializePalette, deserializePalette, medianCutQuantize } from "./palette";
+import { type PaletteColor, type PaletteSize, serializePalette, deserializePalette } from "./palette";
 import { type GlyphFeature, buildGlyphTable, ALL_GLYPHS } from "./glyphs";
 import { type AtvToken, type DeltaEntry, type MotionBlock, estimateMotion, applyMotionPrediction, computeDelta, applyDelta } from "./motion";
 import {
   rleEncode, rleDecode, buildHuffmanTable, buildDecodeTable,
   huffmanEncode, huffmanDecode, computeFrequencies,
-  serializeHuffmanTable, deserializeHuffmanTable,
-  BitWriter, BitReader
+  serializeHuffmanTable, deserializeHuffmanTable
 } from "./entropy";
 import { gzip, gunzip } from "../format";
 
@@ -273,13 +272,11 @@ export interface AtvEncodeProgress {
 export async function encodeAtv(
   frames: Array<{ analysis: import("./analysis").FrameAnalysis; tokens: AtvToken[][] }>,
   palette: PaletteColor[],
-  glyphs: GlyphFeature[],
   opts: EncodeAtvOptions = {},
   onProgress?: (p: AtvEncodeProgress) => void
 ): Promise<Uint8Array> {
   const {
     fps = 15,
-    paletteSize = 256,
     colorMode = true,
     glyphSet = ALL_GLYPHS,
     keyFrameInterval = 30,
@@ -422,7 +419,7 @@ export async function initAtvDecoder(compressed: Uint8Array): Promise<AtvDecoder
     frameOffsets.push(scanP);
     const frameType = raw[scanP];
     if (frameType === 0x4b) {
-      const [rleCount, sp2] = readUint32(raw, scanP + 1);
+      const [, sp2] = readUint32(raw, scanP + 1);
       const [glyphLen, sp3] = readUint32(raw, sp2);
       let fp = sp3 + glyphLen;
       if (colorMode) {
