@@ -301,6 +301,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const remoteFitRef  = useRef({ cols: 60, rows: 34 });
   const sendFitRef    = useRef({ cols: 60, rows: 34 }); // actual capture/send grid — see renderLoop
   const qualityScaleRef = useRef(1);
+  const lastResChangeRef = useRef(0);
   const myIdRef       = useRef("");
   const roomRef       = useRef("");
   const modeRef       = useRef<Mode>(null);
@@ -346,14 +347,31 @@ export default function CallTab({ opts, updateOpt }: Props) {
 
   const MIN_FONT_PX = 5;
   const CHAR_W_RATIO = 0.575, CHAR_H_RATIO = 1.1;
-  const MAX_CELLS = 12000;
+  // SEND_MAX_CELLS caps what we actually capture, encode and transmit —
+  // kept well below the old MAX_CELLS=12000 (which sized a grid for
+  // *reading comfortably*, i.e. the most detail a panel could legibly show
+  // at a 5px font, not for what a phone can realistically push through a
+  // JS-side encoder + WebRTC data channel in real time). The earlier fix
+  // that based the outgoing grid on the full remote-viewing panel at that
+  // 12000-cell cap was the actual cause of "highly unstable" video it was
+  // meant to fix for: on a typical phone panel that resolves to roughly
+  // 120x100 (~12000 chars) sent up to 48fps, which is enough encode+bit-pack
+  // +diff+send work per frame to overload a single JS thread — the
+  // resulting drops/latency then triggered adaptQuality() downgrades, which
+  // forced a resolution change (and a keyframe burst), which looked like
+  // flicker/instability on top of the underlying stutter. 3600 is still
+  // ~1.8x the original hardcoded 60x34 (2040-cell) PIP-sized default, so
+  // detail is still meaningfully better, just not at a size the pipeline
+  // can't sustain in real time. The per-level resScale (call.ts) then
+  // scales further down from this ceiling under congestion.
+  const SEND_MAX_CELLS = 3600;
 
-  const gridForPanel = (width: number, height: number) => {
+  const gridForPanel = (width: number, height: number, maxCells = SEND_MAX_CELLS) => {
     let cols = Math.max(10, Math.floor(width  / (MIN_FONT_PX * CHAR_W_RATIO)));
     let rows = Math.max(6,  Math.floor(height / (MIN_FONT_PX * CHAR_H_RATIO)));
     const cells = cols * rows;
-    if (cells > MAX_CELLS) {
-      const scale = Math.sqrt(MAX_CELLS / cells);
+    if (cells > maxCells) {
+      const scale = Math.sqrt(maxCells / cells);
       cols = Math.max(10, Math.floor(cols * scale));
       rows = Math.max(6,  Math.floor(rows * scale));
     }
@@ -505,7 +523,17 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const scale = qualityScaleRef.current;
     const cols  = Math.max(14, Math.round(base.cols * scale));
     const rows  = Math.max(8,  Math.round(base.rows * scale));
-    if (cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) {
+    // A resolution change forces a keyframe downstream (CallManager sees a
+    // dimension mismatch against the previous sent frame) and a visible
+    // resize/flash on the receiving end, so it's worth debouncing beyond
+    // what adaptQuality()'s own 2-consecutive-check requirement already
+    // gives it — this is cheap extra insurance against visible thrash if
+    // network conditions are genuinely borderline and bouncing between two
+    // quality levels.
+    const resChangeNow = performance.now();
+    const resChangeDue = resChangeNow - lastResChangeRef.current > 1200;
+    if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && resChangeDue) {
+      lastResChangeRef.current = resChangeNow;
       sendFitRef.current = { cols, rows };
       const fs = fontSizeForGrid(localAreaRef.current, cols, rows);
       pre.style.fontSize   = fs + "px";

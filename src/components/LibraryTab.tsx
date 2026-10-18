@@ -74,46 +74,91 @@ export default function LibraryTab({ fontSize, refreshKey, onEdit }: Props) {
     };
   };
 
+  // Waits for an event with a hard timeout — a `video.onseeked` (or
+  // `onloadeddata`) handler that never fires is exactly what used to hang
+  // this whole import forever ("the app stucks there, freezes"): no error
+  // path, nothing to catch, the enclosing promise just never settles. This
+  // turns a missing event into a resolved (not rejected) promise after
+  // `ms`, so the import degrades — a skipped/duplicated frame, or a shorter
+  // video — instead of hanging indefinitely.
+  function waitForEvent(target: HTMLVideoElement, event: "loadeddata" | "seeked", ms: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      let done = false;
+      const finish = () => { if (done) return; done = true; target.removeEventListener(event, finish); resolve(); };
+      target.addEventListener(event, finish, { once: true });
+      setTimeout(finish, ms);
+    });
+  }
+
   const importVideo = async (file: File): Promise<LibraryItem> => {
     const url = URL.createObjectURL(file);
     const video = document.createElement("video");
-    video.src = url; video.muted = true;
-    await new Promise<void>((res, rej) => { video.onloadedmetadata = () => res(); video.onerror = rej; });
-    const W = 80, H = 30, fps = 10;
-    const canvas = document.createElement("canvas");
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext("2d")!;
-    const chars = " .:-=+*#%@";
-    const frames: number[][][] = [], colorFrames: number[][][][] = [];
-    const duration = video.duration;
-    const frameCount = Math.min(Math.floor(duration * fps), 300);
-    for (let fi = 0; fi < frameCount; fi++) {
-      const t = (fi / frameCount) * duration;
-      video.currentTime = t;
-      await new Promise<void>(res => { video.onseeked = () => res(); });
-      ctx.drawImage(video, 0, 0, W, H);
-      const px = ctx.getImageData(0, 0, W, H).data;
-      const frame: number[][] = [], colorFrame: number[][][] = [];
-      for (let y = 0; y < H; y++) {
-        const row: number[] = [], cr: number[][] = [];
-        for (let x = 0; x < W; x++) {
-          const i = (y*W+x)*4;
-          const lum = 0.299*px[i] + 0.587*px[i+1] + 0.114*px[i+2];
-          row.push(Math.min(Math.floor(lum/256*chars.length), chars.length-1));
-          cr.push([px[i], px[i+1], px[i+2]]);
+    video.src = url;
+    video.muted = true;
+    video.playsInline = true;
+    // Off-DOM <video> elements are unreliable for frame-by-frame seeking on
+    // several mobile browsers (notably Android WebView/Chrome) — decoding
+    // can stall or `seeked` can simply never fire when the element isn't
+    // part of the layout. Keeping it attached (just invisible, not
+    // display:none, which some engines treat the same as detached for
+    // decode purposes) is what made this import step actually finish
+    // reliably on a phone instead of hanging on the very first seek.
+    video.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;";
+    document.body.appendChild(video);
+    try {
+      await new Promise<void>((res, rej) => { video.onerror = () => rej(new Error("Couldn't read that video file")); video.load(); });
+      // loadedmetadata only guarantees duration/dimensions, not that a
+      // frame is actually decoded and ready to draw — waiting for
+      // loadeddata (with a timeout fallback, since some browsers are slow
+      // or inconsistent about firing it for very short/odd clips) is what
+      // the first drawImage below actually needs.
+      await waitForEvent(video, "loadeddata", 4000);
+      const W = 80, H = 30, fps = 10;
+      const canvas = document.createElement("canvas");
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext("2d")!;
+      const chars = " .:-=+*#%@";
+      const frames: number[][][] = [], colorFrames: number[][][][] = [];
+      const duration = video.duration || 0;
+      const frameCount = Math.min(Math.floor(duration * fps), 300);
+      for (let fi = 0; fi < frameCount; fi++) {
+        const t = (fi / frameCount) * duration;
+        video.currentTime = t;
+        // 1.5s per-frame cap: if a seek never resolves, skip it rather than
+        // hang the whole import on one bad frame.
+        await waitForEvent(video, "seeked", 1500);
+        ctx.drawImage(video, 0, 0, W, H);
+        const px = ctx.getImageData(0, 0, W, H).data;
+        const frame: number[][] = [], colorFrame: number[][][] = [];
+        for (let y = 0; y < H; y++) {
+          const row: number[] = [], cr: number[][] = [];
+          for (let x = 0; x < W; x++) {
+            const i = (y*W+x)*4;
+            const lum = 0.299*px[i] + 0.587*px[i+1] + 0.114*px[i+2];
+            row.push(Math.min(Math.floor(lum/256*chars.length), chars.length-1));
+            cr.push([px[i], px[i+1], px[i+2]]);
+          }
+          frame.push(row); colorFrame.push(cr);
         }
-        frame.push(row); colorFrame.push(cr);
+        frames.push(frame); colorFrames.push(colorFrame);
+        // Yield to the main thread every few frames so the "importing…"
+        // badge actually stays responsive/paintable on a long video instead
+        // of the whole decode-draw-quantize loop running as one unbroken
+        // synchronous stretch between seeks.
+        if (fi % 5 === 4) await new Promise(r => setTimeout(r, 0));
       }
-      frames.push(frame); colorFrames.push(colorFrame);
+      if (frames.length === 0) throw new Error("Couldn't read any frames from that video");
+      return {
+        id: genId(), name: file.name, createdAt: Date.now(), source: "import", kind: "video",
+        charset: chars, asciiW: W, asciiH: H, frameCount: frames.length,
+        frames, colorFrames,
+        thumbnail: makeThumbnail(frames, chars, W, H),
+        fps,
+      };
+    } finally {
+      video.remove();
+      URL.revokeObjectURL(url);
     }
-    URL.revokeObjectURL(url);
-    return {
-      id: genId(), name: file.name, createdAt: Date.now(), source: "import", kind: "video",
-      charset: chars, asciiW: W, asciiH: H, frameCount: frames.length,
-      frames, colorFrames,
-      thumbnail: makeThumbnail(frames, chars, W, H),
-      fps,
-    };
   };
 
   const importTxt = async (file: File): Promise<LibraryItem> => {
@@ -141,10 +186,17 @@ export default function LibraryTab({ fontSize, refreshKey, onEdit }: Props) {
     setImporting(true);
     try {
       const name = file.name.toLowerCase();
+      // importVideo has its own internal per-step timeouts, but this is a
+      // last-resort backstop: no import step should ever be able to leave
+      // the "importing…" badge stuck forever with no way out for the
+      // person using the app, even if some future edge case (a browser
+      // quirk, a malformed file) slips past the inner guards.
+      const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T> =>
+        Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error("Import timed out")), ms))]);
       let item: LibraryItem;
-      if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name)) item = await importImage(file);
-      else if (/\.(mp4|webm|mov|avi)$/i.test(name)) item = await importVideo(file);
-      else item = await importTxt(file);
+      if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name)) item = await withTimeout(importImage(file), 15000);
+      else if (/\.(mp4|webm|mov|avi)$/i.test(name)) item = await withTimeout(importVideo(file), 60000);
+      else item = await withTimeout(importTxt(file), 15000);
       await saveLibraryItem(item);
       await load();
     } catch (e) {
