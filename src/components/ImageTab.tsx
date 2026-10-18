@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { processFrame, frameToHtml, type AsciiOptions, type AsciiFrame } from "../lib/ascii";
 import { saveLibraryItem, makeThumbnail, genId, type LibraryItem } from "../lib/library";
-import { exportPng, exportJpeg, framesToText } from "../lib/export";
+import { exportPng, exportJpeg } from "../lib/export";
 import { makeFilename, triggerDownload, getExportBg } from "../types";
 import ControlsPanel from "./ControlsPanel";
 
@@ -30,7 +30,6 @@ export default function ImageTab({ opts, updateOpt, fontSize, setFontSize, onRes
   const cropPreviewRef = useRef<HTMLCanvasElement>(null);
   const colorInputRef = useRef<HTMLInputElement>(null);
   const lastFrameRef = useRef<AsciiFrame | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragRef = useRef<{ handle: DragHandle; startX: number; startY: number; startCrop: Crop } | null>(null);
 
   const [loaded, setLoaded] = useState(false);

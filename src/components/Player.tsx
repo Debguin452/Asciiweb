@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { frameToHtml } from "../lib/ascii";
 import type { LibraryItem } from "../lib/library";
 
 interface Props {

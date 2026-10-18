@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { getLibraryItems, deleteLibraryItem, saveLibraryItem, makeThumbnail, genId, type LibraryItem } from "../lib/library";
-import { makeFilename } from "../types";
 import Player from "./Player";
 import Modal from "./Modal";
 
@@ -106,7 +105,7 @@ export default function LibraryTab({ fontSize, refreshKey, onEdit }: Props) {
     video.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;";
     document.body.appendChild(video);
     try {
-      await new Promise<void>((res, rej) => { video.onerror = () => rej(new Error("Couldn't read that video file")); video.load(); });
+      await new Promise<void>((res, rej) => { video.onerror = () => rej(new Error("Couldn't read that video file")); video.onloadedmetadata = () => res(); video.load(); });
       // loadedmetadata only guarantees duration/dimensions, not that a
       // frame is actually decoded and ready to draw — waiting for
       // loadeddata (with a timeout fallback, since some browsers are slow

@@ -64,7 +64,7 @@ export default function CameraTab({ opts, updateOpt, fontSize, setFontSize, onRe
   const [fullscreen, setFullscreen] = useState(false);
   const [camQuality, setCamQuality] = useState<CamQuality>("balanced");
   const [showStats, setShowStats] = useState(false);
-  const [resolution, setResolution] = useState<"480p" | "720p" | "1080p">("720p");
+  const resolution: "480p" | "720p" | "1080p" = "720p";
   const [processingTime, setProcessingTime] = useState(0);
   const [wasmActive, setWasmActive] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');

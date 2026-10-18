@@ -34,7 +34,7 @@ export default function ControlsPanel({ opts, updateOpt, fontSize, setFontSize, 
         <span className="section-title">{section}</span>
         <button className="btn btn-ghost btn-xs" onClick={next} disabled={si === SECTIONS.length - 1}>▶</button>
         <div className="section-dots">
-          {SECTIONS.map((s, i) => (
+          {SECTIONS.map(s => (
             <button key={s} className={`dot-btn ${s === section ? "dot-active" : ""}`} onClick={() => setSection(s)} />
           ))}
         </div>

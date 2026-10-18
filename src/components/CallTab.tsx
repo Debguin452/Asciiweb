@@ -57,7 +57,7 @@ function paintRemote(frame: RemoteFrame, pre: HTMLPreElement) {
 function sampleColorFrame(
   video: HTMLVideoElement, canvas: HTMLCanvasElement,
   cols: number, rows: number, mirror: boolean
-): { html: string; colors: Uint8Array; rgba: Uint8ClampedArray; w: number; h: number } | null {
+): { html: string; rgba: Uint8ClampedArray; w: number; h: number } | null {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || !vh) return null;
   const iw = Math.max(1, cols), ih = Math.max(1, rows);
@@ -70,8 +70,6 @@ function sampleColorFrame(
   else ctx.drawImage(video, 0, 0, vw, vh, 0, 0, iw, ih);
   ctx.restore();
   const px = ctx.getImageData(0, 0, iw, ih).data;
-  const N = iw * ih;
-  const colors = new Uint8Array(N * 3);
   const lines: string[] = new Array(ih);
   for (let y = 0; y < ih; y++) {
     const parts: string[] = [];
@@ -79,8 +77,6 @@ function sampleColorFrame(
     for (let x = 0; x < iw; x++) {
       const o4 = (y * iw + x) * 4;
       const cr = px[o4], cg = px[o4 + 1], cb = px[o4 + 2];
-      const ci = y * iw + x;
-      colors[ci * 3] = cr; colors[ci * 3 + 1] = cg; colors[ci * 3 + 2] = cb;
       if (cr === rr && cg === rg && cb === rb) {
         rt += BLOCK;
       } else {
@@ -91,7 +87,7 @@ function sampleColorFrame(
     if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
     lines[y] = parts.join("");
   }
-  return { html: lines.join("\n"), colors, rgba: px, w: iw, h: ih };
+  return { html: lines.join("\n"), rgba: px, w: iw, h: ih };
 }
 
 const CALL_OPTS: Partial<AsciiOptions> = {
@@ -557,7 +553,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
       const o      = optsRef.current;
       const result = renderToString(video, offscreen.current, {
         ...o, ...CALL_OPTS, asciiW: pip.cols, asciiH: pip.rows, color: false,
-      }, isMirror, "html");
+      }, isMirror, "text");
       if (result) {
         pre.textContent = result.html;
         if (callRef.current?.isConnected) {
