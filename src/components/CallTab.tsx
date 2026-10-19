@@ -10,6 +10,10 @@ import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary"
 interface Props {
   opts: AsciiOptions;
   updateOpt: <K extends keyof AsciiOptions>(k: K, v: AsciiOptions[K]) => void;
+  /** Room code from an invite link (/call/CODE) — pre-fills the join box. */
+  inviteCode?: string;
+  /** Called once the invite has been used (or the call ended) so the URL can drop back to /call. */
+  onInviteConsumed?: () => void;
 }
 
 type Screen = "home" | "starting" | "in-call";
@@ -489,7 +493,7 @@ const IconMicOff = (
   </svg>
 );
 
-export default function CallTab({ opts, updateOpt }: Props) {
+export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteConsumed }: Props) {
   const videoRef      = useRef<HTMLVideoElement>(null);
   const audioRef      = useRef<HTMLAudioElement>(null);
   const offscreen     = useRef(document.createElement("canvas"));
@@ -543,6 +547,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const [remoteCamOff, setRemoteCamOff] = useState(false);
   const [fps,          setFps]          = useState(0);
   const [copied,       setCopied]       = useState(false);
+  const [linkCopied,   setLinkCopied]   = useState(false);
   const [joining,      setJoining]      = useState(false);
   const [starting,     setStarting]     = useState(false);
   const [fullscreen,   setFullscreen]   = useState(false);
@@ -555,6 +560,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
     lastResChangeRef.current = 0; // let the capture grid adopt the new mode's budget immediately
     resetTemporalSmoothing();
   }, [callMode]);
+  useEffect(() => { if (inviteCode && /^[A-Z0-9]{4,16}$/.test(inviteCode)) setJoinVal(inviteCode); }, [inviteCode]);
   useEffect(() => { facingRef.current  = facing;     }, [facing]);
   useEffect(() => { mutedRef.current   = muted;      }, [muted]);
   useEffect(() => { camOffRef.current  = camOff;     }, [camOff]);
@@ -909,6 +915,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const code = joinVal.trim().toUpperCase();
     if (!code) return;
     setJoining(true); setConnectErr(null);
+    if (inviteCode) onInviteConsumed?.();
 
     if (screen === "home") {
       await startCam();
@@ -959,6 +966,17 @@ export default function CallTab({ opts, updateOpt }: Props) {
     setMuted(false); setCamOff(false);
     resetTemporalSmoothing();
     setTimeout(initMgr, 300);
+    if (inviteCode) onInviteConsumed?.();
+  };
+
+  const callLink = () => `${window.location.origin}/call/${myCode}`;
+  const shareLink = async () => {
+    const url = callLink();
+    try {
+      if (navigator.share) { await navigator.share({ title: "Join my asciiweb call", text: "Join my ASCII video call:", url }); return; }
+    } catch (e) { if (e instanceof DOMException && e.name === "AbortError") return; }
+    navigator.clipboard.writeText(url).catch(() => {});
+    setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000);
   };
 
   const copyCode = () => {
@@ -997,6 +1015,9 @@ export default function CallTab({ opts, updateOpt }: Props) {
             <p className="call-home-desc">Face-to-face in ASCII art. No account. No download.</p>
           </div>
           <div className="call-home-actions">
+            {inviteCode && joinVal === inviteCode && (
+              <p className="call-invite-note">You’ve been invited to call <strong>{inviteCode}</strong> — tap Join.</p>
+            )}
             <button className="call-big-btn call-big-primary" onClick={startCall} disabled={starting}>
               {starting ? <><span className="call-btn-spinner" />Starting…</> : <>{IconPhone} Start a call</>}
             </button>
@@ -1042,7 +1063,10 @@ export default function CallTab({ opts, updateOpt }: Props) {
           <div className="call-code-display">
             {myCode.split("").map((ch, i) => <span key={i} className="call-code-char">{ch}</span>)}
           </div>
-          <button className="call-copy-btn" onClick={copyCode}>{copied ? "Copied!" : "Copy code"}</button>
+          <div className="call-copy-row">
+            <button className="call-copy-btn" onClick={copyCode}>{copied ? "Copied!" : "Copy code"}</button>
+            <button className="call-copy-btn" onClick={shareLink}>{linkCopied ? "Link copied!" : typeof navigator !== "undefined" && "share" in navigator ? "Share link" : "Copy link"}</button>
+          </div>
           <p className="call-wait-hint">Waiting for the other person to join…</p>
           {callStatus === "connecting" && (
             <p className="call-connecting-msg"><span className="call-btn-spinner" />Connecting…</p>
