@@ -553,7 +553,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
       const o      = optsRef.current;
       const result = renderToString(video, offscreen.current, {
         ...o, ...CALL_OPTS, asciiW: pip.cols, asciiH: pip.rows, color: false,
-      }, isMirror, "text");
+      }, isMirror, "html");
       if (result) {
         pre.textContent = result.html;
         if (callRef.current?.isConnected) {
@@ -584,19 +584,47 @@ export default function CallTab({ opts, updateOpt }: Props) {
 
   useEffect(() => () => { streamRef.current?.getTracks().forEach(t => t.stop()); }, []);
 
-  const startCam = async (face: Facing = facing) => {
+  // Returns whether the camera actually started — callers must check this
+  // (this used to throw-swallow internally, which meant `try { await
+  // startCam() } catch` in startCall()/joinCall() never actually caught
+  // anything: a failed camera silently let the call proceed anyway).
+  //
+  // Also retries once on NotReadableError/TrackStartError specifically —
+  // Android Chrome commonly throws that for a brief moment right after a
+  // previous MediaStream's tracks are stopped, because the OS hasn't
+  // released the camera hardware handle yet. That race is exactly why
+  // "close the call and start again" used to fix it: by the second
+  // attempt the handle was free. Retrying here once, a moment later, does
+  // the same thing automatically instead of making the person notice and
+  // back out manually.
+  const startCam = async (face: Facing = facing): Promise<boolean> => {
     setCamErr(null);
+    if (videoRef.current) videoRef.current.srcObject = null;
     streamRef.current?.getTracks().forEach(t => t.stop());
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: face, width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: true,
-      });
-      streamRef.current = s;
-      if (videoRef.current) { videoRef.current.srcObject = s; await videoRef.current.play(); }
-      callRef.current?.answerWithStream(s);
-      setCamOff(false);
-    } catch (e) { setCamErr(e instanceof Error ? e.message : "Camera denied"); }
+    streamRef.current = null;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: face, width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: true,
+        });
+        streamRef.current = s;
+        if (videoRef.current) { videoRef.current.srcObject = s; await videoRef.current.play(); }
+        callRef.current?.answerWithStream(s);
+        setCamOff(false);
+        return true;
+      } catch (e) {
+        const name = e instanceof Error ? e.name : "";
+        if (attempt === 0 && (name === "NotReadableError" || name === "TrackStartError")) {
+          await new Promise(r => setTimeout(r, 400));
+          continue;
+        }
+        setCamErr(e instanceof Error ? e.message : "Camera denied");
+        return false;
+      }
+    }
+    return false;
   };
 
   const flipCam = () => {
@@ -624,11 +652,8 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const startCall = async () => {
     setStarting(true); setCamErr(null); setConnectErr(null);
 
-    try { await startCam(); }
-    catch (e) {
-      setCamErr(e instanceof Error ? e.message : "Camera failed");
-      setStarting(false); return;
-    }
+    const camOk = await startCam();
+    if (!camOk) { setStarting(false); return; }
 
     let attempts = 0;
     while (!myIdRef.current && attempts < 20) {
