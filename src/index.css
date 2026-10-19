@@ -1051,6 +1051,52 @@ html, body, #root {
 }
 .call-circle-end:hover { background: #ff1a0e; border-color: #ff1a0e; color: #fff; }
 
+/* Display-mode drop-down (ASCII / Color / Pixel) */
+.call-mode-wrap { position: relative; display: flex; flex-shrink: 0; }
+.call-mode-menu {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 12px);
+  transform: translateX(-50%);
+  z-index: 30;
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  min-width: 208px;
+  max-width: calc(100vw - 24px);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+  animation: call-mode-pop 0.12s ease-out;
+}
+@keyframes call-mode-pop { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.call-mode-opt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: var(--font);
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.call-mode-opt:hover, .call-mode-opt:focus-visible { background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg); outline: none; }
+.call-mode-opt.is-selected { color: var(--fg); background: color-mix(in srgb, var(--fg) 12%, transparent); }
+.call-mode-opt-icon { display: inline-flex; flex-shrink: 0; }
+.call-mode-opt-text { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.call-mode-opt-name { font-size: 12px; font-weight: 600; letter-spacing: 0.04em; }
+.call-mode-opt-hint { font-size: 10px; opacity: 0.7; }
+.call-mode-check { font-size: 12px; flex-shrink: 0; }
+
+/* Colored ASCII is tuned (brightness-lifted) for a dark backdrop, whatever the theme. */
+.call-panel-wa-local.call-area-dark { background: #000; }
+
 .call-bar { padding-bottom: 28px; }
 
 @media (max-width: 720px) {
