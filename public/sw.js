@@ -13,7 +13,7 @@
 // cache only when the network is unreachable (offline). That keeps the
 // "works offline" property while making sure a browser that *can* reach
 // the network always gets the latest deploy.
-const CACHE = "asciiweb-v2";
+const CACHE = "asciiweb-v3";
 
 self.addEventListener("install", e => {
   e.waitUntil(
