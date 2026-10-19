@@ -570,10 +570,10 @@ export class CallManager {
     return force;
   }
 
-  /** Color / Pixel (color-block) modes — send only color data; `pixelated` tells the peer to draw hard edges. rgba is w*h*4 RGBA bytes (alpha ignored). */
-  sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false) {
-    if (!this.dataConn?.open) return;
-    if (!this.throttle()) return;
+  /** Color / Pixel (color-block) modes — send only color data; `pixelated` tells the peer to draw them as solid █ character cells (Pixel mode). Returns what was sent, for the local preview. rgba is w*h*4 RGBA bytes (alpha ignored). */
+  sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false): { palette: Uint8Array; indices: Uint8Array } | null {
+    if (!this.dataConn?.open) return null;
+    if (!this.throttle()) return null;
 
     this.frameCount++;
     const N = w * h;
@@ -588,6 +588,7 @@ export class CallManager {
       forceKeyframe,
     });
     this.dispatch(buf, null, q.indices, forceKeyframe);
+    return { palette: q.palette, indices: q.indices };
   }
 
   private throttle(): boolean {
