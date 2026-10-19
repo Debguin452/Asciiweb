@@ -242,6 +242,11 @@ export async function decodeAsvOrAsp(data: Uint8Array): Promise<DecodedAsv> {
   let p = 4;
 
   const metaLen = (raw[p++] << 8) | raw[p++];
+  // Advance by the declared metaLen (the authoritative, stored length)
+  // rather than decodeMetadata's own return position — if a future format
+  // revision adds metadata fields this parser doesn't know about yet,
+  // metaLen still skips past all of them correctly, where trusting the
+  // parser's own end-position would silently truncate into frame data.
   const { meta } = decodeMetadata(raw, p);
   p = p + metaLen;
 

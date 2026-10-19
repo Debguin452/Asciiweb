@@ -111,6 +111,20 @@ export class CallManager {
   private consecutiveBad = 0;
   private readonly CHECK_FRAMES = 15;
 
+  // iceStateChanged only fires when the browser itself notices the
+  // RTCPeerConnection changed state (failed/disconnected). It does NOT
+  // cover the common "silent hang" case: a NAT rebinding, a backgrounded
+  // tab whose radio drops the link, or a corporate firewall that starts
+  // quietly dropping UDP packets mid-call — the connection can keep
+  // reporting "connected" while literally nothing gets through. A small
+  // heartbeat (sent even when the camera is off and no real frames are
+  // flowing) plus a last-received-anything timestamp lets us detect that
+  // case ourselves instead of hanging forever with a "connected" UI.
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private lastRecvAt = 0;
+  private readonly HEARTBEAT_INTERVAL = 3000;
+  private readonly STALE_TIMEOUT = 9000;
+
   constructor(events: CallManagerEvents) {
     this.events = events;
   }
@@ -294,11 +308,16 @@ export class CallManager {
       this.events.onStatus("connected");
       this.receivedKeyframe = false;
       this.prevRecvFrame    = null;
+      this.lastRecvAt       = performance.now();
+      this.startHeartbeat();
     });
 
     conn.on("data", (data: unknown) => {
+      this.lastRecvAt = performance.now();
+
       if (data && typeof data === "object" && "type" in (data as Record<string, unknown>)) {
         const st = data as { type: string; micMuted: boolean; camOff: boolean };
+        if (st.type === "ping") return; // liveness only, nothing to render
         if (st.type === "state") {
           this.events.onRemoteState?.({ micMuted: st.micMuted, camOff: st.camOff });
           return;
@@ -340,9 +359,46 @@ export class CallManager {
     });
 
     conn.on("close", () => {
+      this.stopHeartbeat();
       if (!this.destroyed) this.events.onStatus("closed");
     });
-    conn.on("error", err => this.events.onStatus("error", err.message));
+    conn.on("error", err => {
+      this.stopHeartbeat();
+      this.events.onStatus("error", err.message);
+    });
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.dataConn?.open) return;
+      try { this.dataConn.send({ type: "ping" }); } catch { /* noop — next tick or iceStateChanged will catch a truly dead channel */ }
+
+      const now = performance.now();
+      if (now - this.lastRecvAt > this.STALE_TIMEOUT) {
+        // Nothing — not a video frame, a state update, nor the peer's own
+        // ping — has come through in STALE_TIMEOUT ms, despite the data
+        // channel reporting itself open. Treat this the same way a
+        // "failed" iceStateChanged is treated: reconnect if we still have
+        // attempts left, otherwise surface it as a lost connection.
+        this.lastRecvAt = now; // reset so we don't refire every tick while rejoin() works
+        if (this.destroyed) return;
+        if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          this.reconnectAttempts++;
+          this.events.onStatus("reconnecting");
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = setTimeout(() => {
+            if (!this.destroyed) this.rejoin();
+          }, RECONNECT_DELAY);
+        } else {
+          this.events.onStatus("error", "Connection lost");
+        }
+      }
+    }, this.HEARTBEAT_INTERVAL);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
   /** ASCII mode — sends character indices, optionally with per-cell color. */
@@ -482,6 +538,7 @@ export class CallManager {
 
   hangup() {
     this.destroyed = true;
+    this.stopHeartbeat();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     this.reconnectAttempts = 0;
     this.remoteId = null;
