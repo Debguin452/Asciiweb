@@ -5,15 +5,62 @@ import {
   wasmGeneratePalette, readWasmPalette,
 } from "./wasm-wrapper";
 
-const ICE_SERVERS: RTCIceServer[] = [
+// Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
+// that was the Cloudflare-billed path, skipped in favor of this) or its
+// fetch fails for any other reason. ExpressTURN's free-tier credentials are
+// static/account-scoped (not a per-session secret), and their own docs say
+// that's fine to use directly in client code for this tier — see
+// https://www.expressturn.com/docs/peerjs. This replaces the old
+// turn:openrelay.metered.ca entries, which used a widely shared,
+// unauthenticated free demo credential (openrelayproject/openrelayproject)
+// copied into countless WebRTC tutorials — exactly the kind of overloaded/
+// rate-limited shared endpoint that was the leading suspect for "mostly
+// fails to connect, works by luck" on mobile data or behind strict/
+// corporate NATs (TURN relay is specifically what's needed there; STUN
+// alone isn't enough). The plain stun:* entries stay as extra, free,
+// unauthenticated candidate sources regardless.
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
-  { urls: "stun:openrelay.metered.ca:80" },
-  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "stun:free.expressturn.com:3478" },
+  {
+    urls: [
+      "turn:free.expressturn.com:3478?transport=udp",
+      "turn:free.expressturn.com:3478?transport=tcp",
+    ],
+    username: "000000002107743162",
+    credential: "PDWdMB8cuWFugJUzH8rdv6hCUnY=",
+  },
 ];
+
+// Cached across calls in the same page session — no need to re-fetch fresh
+// short-lived credentials (1hr TTL, see turn.ts) for every single call.
+let cachedIceServers: RTCIceServer[] | null = null;
+let cachedIceServersAt = 0;
+const ICE_SERVERS_CACHE_MS = 30 * 60 * 1000; // refetch well before the 1hr TTL expires
+
+async function fetchIceServers(): Promise<RTCIceServer[]> {
+  const now = Date.now();
+  if (cachedIceServers && now - cachedIceServersAt < ICE_SERVERS_CACHE_MS) {
+    return cachedIceServers;
+  }
+  try {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch("/api/turn", { signal: ctrl.signal });
+    clearTimeout(timeout);
+    if (r.ok) {
+      const data = await r.json() as { iceServers?: RTCIceServer[] };
+      if (Array.isArray(data.iceServers) && data.iceServers.length) {
+        cachedIceServers = data.iceServers;
+        cachedIceServersAt = now;
+        return cachedIceServers;
+      }
+    }
+  } catch { /* /api/turn not set up yet, or offline — fall back below */ }
+  return FALLBACK_ICE_SERVERS;
+}
 
 const RECONNECT_DELAY = 1500;
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -131,8 +178,10 @@ export class CallManager {
 
   async start(): Promise<string> {
     this.destroyed = false;
+    const iceServers = await fetchIceServers();
+    if (this.destroyed) throw new Error("destroyed");
     return new Promise((resolve, reject) => {
-      const peer = new Peer({ config: { iceServers: ICE_SERVERS }, debug: 1 });
+      const peer = new Peer({ config: { iceServers }, debug: 1 });
       this.peer = peer;
 
       const timeout = setTimeout(() => reject(new Error("Signaling timeout")), 10000);
