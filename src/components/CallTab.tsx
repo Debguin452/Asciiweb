@@ -16,48 +16,134 @@ type Screen = "home" | "starting" | "in-call";
 type Facing = "user" | "environment";
 type Mode   = "host" | "guest" | null;
 
-const BLOCK = "\u2588";
+const CHAR_W_RATIO = 0.575, CHAR_H_RATIO = 1.1;
 
-function paintRemote(frame: RemoteFrame, pre: HTMLPreElement) {
-  const { w, h, charset, charIndices, palette, colorIndices } = frame;
-  const lines: string[] = [];
+// Bumped on every resize so cached layout (font size / canvas size) is recomputed lazily instead of on every frame.
+let layoutEpoch = 0;
+
+function fontSizeForGrid(el: HTMLElement | null, cols: number, rows: number): number {
+  if (!el || !cols || !rows) return 8;
+  const { width, height } = el.getBoundingClientRect();
+  if (!width || !height) return 8;
+  return Math.max(2, Math.floor(Math.min(width / (cols * CHAR_W_RATIO), height / (rows * CHAR_H_RATIO))));
+}
+
+const cvMap  = new WeakMap<HTMLPreElement, HTMLCanvasElement>();
+const imgMap = new WeakMap<HTMLCanvasElement, ImageData>();
+
+function overlayCanvas(pre: HTMLPreElement): HTMLCanvasElement {
+  let cv = cvMap.get(pre);
+  if (!cv) {
+    cv = document.createElement("canvas");
+    Object.assign(cv.style, { position: "absolute", inset: "0", margin: "auto", display: "none", pointerEvents: "none" });
+    pre.insertAdjacentElement("afterend", cv);
+    cvMap.set(pre, cv);
+  }
+  return cv;
+}
+
+function clearPre(pre: HTMLPreElement | null) {
+  if (!pre) return;
+  pre.textContent = "";
+  pre.dataset.m = "t"; pre.dataset.fk = "";
+  const cv = cvMap.get(pre);
+  if (cv) cv.style.display = "none";
+}
+
+function leaveCanvasMode(pre: HTMLPreElement) {
+  if (pre.dataset.m === "c") { const cv = cvMap.get(pre); if (cv) cv.style.display = "none"; pre.dataset.m = "t"; }
+}
+
+function fitFont(pre: HTMLPreElement, area: HTMLElement | null, w: number, h: number) {
+  const key = `${w}x${h}@${layoutEpoch}`;
+  if (pre.dataset.fk === key) return;
+  pre.dataset.fk = key;
+  pre.style.fontSize = fontSizeForGrid(area, w, h) + "px";
+  pre.style.lineHeight = "1.1";
+}
+
+function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, w: number, h: number) {
+  leaveCanvasMode(pre);
+  fitFont(pre, area, w, h);
+  pre.textContent = text;
+}
+
+/** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
+function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData) {
+  const cv = overlayCanvas(pre);
+  if (pre.dataset.m !== "c") { pre.textContent = ""; pre.dataset.m = "c"; cv.style.display = "block"; }
+  const w = img.width, h = img.height;
+  if (cv.width !== w) cv.width = w;
+  if (cv.height !== h) cv.height = h;
+  cv.getContext("2d")!.putImageData(img, 0, 0);
+  const key = `${w}x${h}@${layoutEpoch}`;
+  if (cv.dataset.k !== key) {
+    cv.dataset.k = key;
+    const r = area?.getBoundingClientRect();
+    if (r && r.width && r.height) {
+      const k = Math.min(r.width / (w * CHAR_W_RATIO), r.height / (h * CHAR_H_RATIO));
+      cv.style.width  = Math.floor(w * CHAR_W_RATIO * k) + "px";
+      cv.style.height = Math.floor(h * CHAR_H_RATIO * k) + "px";
+    }
+  }
+}
+
+function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement | null) {
+  const { w, h, charset, charIndices, palette, colorIndices, isBlockColor } = frame;
+
+  if (isBlockColor && palette && colorIndices) {
+    const cv = overlayCanvas(pre);
+    let img = imgMap.get(cv);
+    if (!img || img.width !== w || img.height !== h) { img = new ImageData(w, h); imgMap.set(cv, img); }
+    const pal32 = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) pal32[i] = 0xff000000 | (palette[i * 3 + 2] << 16) | (palette[i * 3 + 1] << 8) | palette[i * 3];
+    const out = new Uint32Array(img.data.buffer);
+    for (let i = 0, n = w * h; i < n; i++) out[i] = pal32[colorIndices[i]];
+    paintCanvas(pre, area, img);
+    return;
+  }
+
+  const lut = Array.from(charset, c => (c === " " ? "\u00a0" : c));
 
   if (palette && colorIndices) {
     const colors = paletteToRgb(palette, colorIndices);
+    const lines: string[] = [];
     for (let y = 0; y < h; y++) {
       const parts: string[] = [];
       let rr = -1, rg = -1, rb = -1, rt = "";
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
         const cr = colors[i * 3], cg = colors[i * 3 + 1], cb = colors[i * 3 + 2];
-        if (cr === rr && cg === rg && cb === rb) {
-          rt += BLOCK;
-        } else {
+        const ch = lut[charIndices[i]] ?? "\u00a0";
+        if (cr === rr && cg === rg && cb === rb) rt += ch;
+        else {
           if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
-          rr = cr; rg = cg; rb = cb; rt = BLOCK;
+          rr = cr; rg = cg; rb = cb; rt = ch;
         }
       }
       if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
       lines.push(parts.join(""));
     }
+    leaveCanvasMode(pre);
+    fitFont(pre, area, w, h);
     pre.innerHTML = lines.join("\n");
-  } else {
-    for (let y = 0; y < h; y++) {
-      let line = "";
-      for (let x = 0; x < w; x++) {
-        const ch = charset[charIndices[y * w + x]] ?? " ";
-        line += ch === " " ? "\u00a0" : ch;
-      }
-      lines.push(line);
-    }
-    pre.textContent = lines.join("\n");
+    return;
   }
+
+  const lines: string[] = new Array(h);
+  for (let y = 0; y < h; y++) {
+    let line = "";
+    const row = y * w;
+    for (let x = 0; x < w; x++) line += lut[charIndices[row + x]] ?? "\u00a0";
+    lines[y] = line;
+  }
+  paintText(pre, area, lines.join("\n"), w, h);
 }
 
 function sampleColorFrame(
   video: HTMLVideoElement, canvas: HTMLCanvasElement,
   cols: number, rows: number, mirror: boolean
-): { html: string; rgba: Uint8ClampedArray; w: number; h: number } | null {
+): ImageData | null {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || !vh) return null;
   const iw = Math.max(1, cols), ih = Math.max(1, rows);
@@ -65,34 +151,22 @@ function sampleColorFrame(
   if (canvas.height !== ih) canvas.height = ih;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) return null;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high"; // area-style downscale: less aliasing/shimmer → better colors and far smaller deltas
   ctx.save();
   if (mirror) { ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, vw, vh, -iw, 0, iw, ih); }
   else ctx.drawImage(video, 0, 0, vw, vh, 0, 0, iw, ih);
   ctx.restore();
-  const px = ctx.getImageData(0, 0, iw, ih).data;
-  const lines: string[] = new Array(ih);
-  for (let y = 0; y < ih; y++) {
-    const parts: string[] = [];
-    let rr = -1, rg = -1, rb = -1, rt = "";
-    for (let x = 0; x < iw; x++) {
-      const o4 = (y * iw + x) * 4;
-      const cr = px[o4], cg = px[o4 + 1], cb = px[o4 + 2];
-      if (cr === rr && cg === rg && cb === rb) {
-        rt += BLOCK;
-      } else {
-        if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
-        rr = cr; rg = cg; rb = cb; rt = BLOCK;
-      }
-    }
-    if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
-    lines[y] = parts.join("");
-  }
-  return { html: lines.join("\n"), rgba: px, w: iw, h: ih };
+  return ctx.getImageData(0, 0, iw, ih);
 }
+
+// 19-step ramp (5 bits/char): the stock 10-step ramp bands faces into a few flat tones. Used unless the user chose a ramp of their own with ≥14 distinct chars.
+const CALL_CHARSET = " .,:;-~=+*iIoxO0#%@";
+const callCharset = (cs: string) => (new Set(cs || "").size >= 14 ? cs : CALL_CHARSET);
 
 const CALL_OPTS: Partial<AsciiOptions> = {
   asciiW: 60, asciiH: 34, brightness: 0, contrast: 100,
-  gamma: 1.0, temporalSmoothing: true, color: false,
+  gamma: 1.0, temporalSmoothing: true, charDensitySort: true, color: false,
   noiseReduction: false, localContrast: false, histEq: false,
 };
 
@@ -295,6 +369,12 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const callRef       = useRef<CallManager | null>(null);
   const optsRef       = useRef(opts);
   const remoteFitRef  = useRef({ cols: 60, rows: 34 });
+  const remoteFitColorRef = useRef({ cols: 80, rows: 45 });
+  const remoteHereRef = useRef(false);
+  const pendingRemote = useRef<RemoteFrame | null>(null);
+  const remoteRaf     = useRef(0);
+  const lastFpsSetRef = useRef(0);
+  const lastPreviewRef = useRef(0);
   const sendFitRef    = useRef({ cols: 60, rows: 34 }); // actual capture/send grid — see renderLoop
   const qualityScaleRef = useRef(1);
   const lastResChangeRef = useRef(0);
@@ -342,27 +422,11 @@ export default function CallTab({ opts, updateOpt }: Props) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const MIN_FONT_PX = 5;
-  const CHAR_W_RATIO = 0.575, CHAR_H_RATIO = 1.1;
-  // SEND_MAX_CELLS caps what we actually capture, encode and transmit —
-  // kept well below the old MAX_CELLS=12000 (which sized a grid for
-  // *reading comfortably*, i.e. the most detail a panel could legibly show
-  // at a 5px font, not for what a phone can realistically push through a
-  // JS-side encoder + WebRTC data channel in real time). The earlier fix
-  // that based the outgoing grid on the full remote-viewing panel at that
-  // 12000-cell cap was the actual cause of "highly unstable" video it was
-  // meant to fix for: on a typical phone panel that resolves to roughly
-  // 120x100 (~12000 chars) sent up to 48fps, which is enough encode+bit-pack
-  // +diff+send work per frame to overload a single JS thread — the
-  // resulting drops/latency then triggered adaptQuality() downgrades, which
-  // forced a resolution change (and a keyframe burst), which looked like
-  // flicker/instability on top of the underlying stutter. 3600 is still
-  // ~1.8x the original hardcoded 60x34 (2040-cell) PIP-sized default, so
-  // detail is still meaningfully better, just not at a size the pipeline
-  // can't sustain in real time. The per-level resScale (call.ts) then
-  // scales further down from this ceiling under congestion.
-  const SEND_MAX_CELLS = 3600;
+  // Cell budget per frame. Capture/convert only runs when a frame will be sent (see renderLoop) and the heavy math is in WASM,
+  // so this can be well above the old 3600; the quality level (resScale in call.ts) scales it down under congestion.
+  const ASCII_MAX_CELLS = 6000, COLOR_MAX_CELLS = 8000;
 
-  const gridForPanel = (width: number, height: number, maxCells = SEND_MAX_CELLS) => {
+  const gridForPanel = (width: number, height: number, maxCells: number) => {
     let cols = Math.max(10, Math.floor(width  / (MIN_FONT_PX * CHAR_W_RATIO)));
     let rows = Math.max(6,  Math.floor(height / (MIN_FONT_PX * CHAR_H_RATIO)));
     const cells = cols * rows;
@@ -379,15 +443,6 @@ export default function CallTab({ opts, updateOpt }: Props) {
   // much larger — capture grid into a tiny box means a small font, which is
   // fine, it's just a thumbnail) and, per-frame, for the remote peer's pane
   // (fitting *their* actual sent resolution, whatever it is).
-  const fontSizeForGrid = (el: HTMLElement | null, cols: number, rows: number): number => {
-    if (!el || !cols || !rows) return 8;
-    const { width, height } = el.getBoundingClientRect();
-    if (!width || !height) return 8;
-    const fsByW = width  / (cols * CHAR_W_RATIO);
-    const fsByH = height / (rows * CHAR_H_RATIO);
-    return Math.max(2, Math.floor(Math.min(fsByW, fsByH)));
-  };
-
   const updateCallFontSize = useCallback(() => {
     // remoteFitRef is sized to *our own* remote-viewing panel — a reasonable
     // stand-in for "how much detail is actually useful", and the baseline
@@ -400,7 +455,8 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const remEl = remoteAreaRef.current;
     if (remEl) {
       const { width, height } = remEl.getBoundingClientRect();
-      if (width && height) remoteFitRef.current = gridForPanel(width, height);
+      if (width && height) { remoteFitRef.current = gridForPanel(width, height, ASCII_MAX_CELLS); remoteFitColorRef.current = gridForPanel(width, height, COLOR_MAX_CELLS); }
+      layoutEpoch++;
     }
 
     // The local PIP box just mirrors whatever grid we're actually sending
@@ -454,21 +510,20 @@ export default function CallTab({ opts, updateOpt }: Props) {
         if (s === "reconnecting") setConnectErr(null);
       },
       onRemoteFrame: (f: RemoteFrame) => {
-        setRemoteHere(true);
-        setPeerHungUp(false);
-        if (remotePreRef.current) {
-          // Size to the frame's *actual* w/h, not an assumption of what the
-          // sender used — their screen size (and, now, their current quality
-          // level) can genuinely differ from ours, and sizing off a stale
-          // guess is what produced the blown-up, blocky look: a low-res
-          // frame stretched via a font size computed for a higher-res one.
-          const fs = fontSizeForGrid(remoteAreaRef.current, f.w, f.h);
-          remotePreRef.current.style.fontSize   = fs + "px";
-          remotePreRef.current.style.lineHeight = "1.1";
-          paintRemote(f, remotePreRef.current);
+        if (!remoteHereRef.current) { remoteHereRef.current = true; setRemoteHere(true); setPeerHungUp(false); }
+        // Paint at most once per display frame, always the newest — a burst after a stall no longer costs N full repaints.
+        pendingRemote.current = f;
+        if (!remoteRaf.current) {
+          remoteRaf.current = requestAnimationFrame(() => {
+            remoteRaf.current = 0;
+            const fr = pendingRemote.current; pendingRemote.current = null;
+            if (fr && remotePreRef.current) paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
+          });
         }
       },
       onRemoteHangup: () => {
+        remoteHereRef.current = false;
+        clearPre(remotePreRef.current);
         setRemoteHere(false);
         setPeerHungUp(true);
         setCallStatus("closed");
@@ -499,82 +554,66 @@ export default function CallTab({ opts, updateOpt }: Props) {
   useEffect(() => { initMgr(); return () => callRef.current?.hangup(); }, [initMgr]);
 
   const renderLoop = useCallback(() => {
+    rafRef.current = requestAnimationFrame(renderLoop);
     const video = videoRef.current, pre = localPreRef.current;
-    if (!video || !pre || video.readyState < 2) {
-      rafRef.current = requestAnimationFrame(renderLoop); return;
-    }
-    if (camOffRef.current) { rafRef.current = requestAnimationFrame(renderLoop); return; }
+    if (!video || !pre || video.readyState < 2 || camOffRef.current) return;
+
+    // Capture → convert → paint only when a frame will actually go out (or, before the call connects, at a modest preview rate).
+    // This used to run at the display refresh rate (60-120 Hz) and discard most of the work in the send throttle.
+    const mgr = callRef.current;
+    const now = performance.now();
+    if (mgr?.isConnected) { if (!mgr.isSendDue()) return; }
+    else if (now - lastPreviewRef.current < 66) return;
+    lastPreviewRef.current = now;
 
     const isColor  = colorModeRef.current;
     const isMirror = facingRef.current === "user";
 
-    // Capture/send resolution: baselined on our own remote-viewing panel
-    // size (a reasonable stand-in for how much detail is worth sending),
-    // scaled down under congestion by the live CallManager quality level.
-    // This used to be fitRef — the tiny local self-view PIP's own grid —
-    // which had nothing to do with how big the recipient's screen is; that
-    // was the main cause of blocky, low-detail video (see onQualityChange
-    // and onRemoteFrame above for the other half of this fix).
-    const base  = remoteFitRef.current;
+    const base  = isColor ? remoteFitColorRef.current : remoteFitRef.current;
     const scale = qualityScaleRef.current;
     const cols  = Math.max(14, Math.round(base.cols * scale));
     const rows  = Math.max(8,  Math.round(base.rows * scale));
-    // A resolution change forces a keyframe downstream (CallManager sees a
-    // dimension mismatch against the previous sent frame) and a visible
-    // resize/flash on the receiving end, so it's worth debouncing beyond
-    // what adaptQuality()'s own 2-consecutive-check requirement already
-    // gives it — this is cheap extra insurance against visible thrash if
-    // network conditions are genuinely borderline and bouncing between two
-    // quality levels.
-    const resChangeNow = performance.now();
-    const resChangeDue = resChangeNow - lastResChangeRef.current > 1200;
-    if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && resChangeDue) {
-      lastResChangeRef.current = resChangeNow;
+    if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && now - lastResChangeRef.current > 1200) {
+      lastResChangeRef.current = now;
       sendFitRef.current = { cols, rows };
-      const fs = fontSizeForGrid(localAreaRef.current, cols, rows);
-      pre.style.fontSize   = fs + "px";
-      pre.style.lineHeight = "1.1";
     }
     const pip = sendFitRef.current;
 
+    let produced = false;
     if (isColor) {
-      const result = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
-      if (result) {
-        pre.innerHTML = result.html;
-        if (callRef.current?.isConnected) {
-          callRef.current.sendColorFrame(result.rgba, result.w, result.h);
-        }
-        const now = performance.now();
-        fpsT.current.push(now);
-        if (fpsT.current.length > 30) fpsT.current.shift();
-        if (fpsT.current.length > 1) setFps(Math.round((fpsT.current.length - 1) / ((now - fpsT.current[0]) / 1000)));
+      const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
+      if (img) {
+        paintCanvas(pre, localAreaRef.current, img);
+        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height);
+        produced = true;
       }
     } else {
-      const o      = optsRef.current;
+      const o = optsRef.current;
+      const cs = callCharset(o.charset);
       const result = renderToString(video, offscreen.current, {
-        ...o, ...CALL_OPTS, asciiW: pip.cols, asciiH: pip.rows, color: false,
-      }, isMirror, "html");
+        ...o, ...CALL_OPTS, charset: cs, asciiW: pip.cols, asciiH: pip.rows, color: false,
+      }, isMirror, "text");
       if (result) {
-        pre.textContent = result.html;
-        if (callRef.current?.isConnected) {
-          const { w, h } = getPoolDims();
-          if (w > 0 && h > 0) {
-            const N   = w * h;
+        const { w, h } = getPoolDims();
+        if (w > 0 && h > 0) {
+          paintText(pre, localAreaRef.current, result.html, w, h);
+          if (mgr?.isConnected) {
             const raw = getPoolCharIdx();
-            callRef.current.sendAsciiFrame(
-              raw.length === N ? raw as unknown as Uint8Array : raw.slice(0, N) as unknown as Uint8Array,
-              w, h, sortCharsetByDensity(o.charset || " .:-=+*#%@"), null
-            );
+            mgr.sendAsciiFrame(raw.length === w * h ? raw : raw.subarray(0, w * h), w, h, sortCharsetByDensity(cs), null);
           }
+          produced = true;
         }
-        const now = performance.now();
-        fpsT.current.push(now);
-        if (fpsT.current.length > 30) fpsT.current.shift();
-        if (fpsT.current.length > 1) setFps(Math.round((fpsT.current.length - 1) / ((now - fpsT.current[0]) / 1000)));
       }
     }
 
-    rafRef.current = requestAnimationFrame(renderLoop);
+    if (produced) {
+      fpsT.current.push(now);
+      if (fpsT.current.length > 30) fpsT.current.shift();
+      if (fpsT.current.length > 1 && now - lastFpsSetRef.current > 500) {
+        lastFpsSetRef.current = now;
+        setFps(Math.round((fpsT.current.length - 1) / ((now - fpsT.current[0]) / 1000))); // not per frame: it re-renders this whole component
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -600,15 +639,20 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const startCam = async (face: Facing = facing): Promise<boolean> => {
     setCamErr(null);
     if (videoRef.current) videoRef.current.srcObject = null;
-    streamRef.current?.getTracks().forEach(t => t.stop());
+    // Keep the live mic track across camera flips: the call's audio sender is bound to that exact track,
+    // so stopping + re-acquiring it silently killed the peer's audio after every flip.
+    const keepAudio = streamRef.current?.getAudioTracks().find(t => t.readyState === "live") ?? null;
+    streamRef.current?.getVideoTracks().forEach(t => t.stop());
+    if (!keepAudio) streamRef.current?.getAudioTracks().forEach(t => t.stop());
     streamRef.current = null;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const s = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: face, width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: true,
+          video: { facingMode: face, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } },
+          audio: keepAudio ? false : { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
+        if (keepAudio) s.addTrack(keepAudio);
         streamRef.current = s;
         if (videoRef.current) { videoRef.current.srcObject = s; await videoRef.current.play(); }
         callRef.current?.answerWithStream(s);
@@ -645,7 +689,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
     t.enabled = camOff;
     const newCamOff = !camOff;
     setCamOff(newCamOff);
-    if (localPreRef.current && !camOff) localPreRef.current.textContent = "";
+    if (!camOff) clearPre(localPreRef.current);
     callRef.current?.sendState(mutedRef.current, newCamOff);
   };
 
@@ -725,8 +769,9 @@ export default function CallTab({ opts, updateOpt }: Props) {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     if (videoRef.current)  videoRef.current.srcObject = null;
-    if (localPreRef.current)  localPreRef.current.textContent  = "";
-    if (remotePreRef.current) remotePreRef.current.textContent = "";
+    clearPre(localPreRef.current);
+    clearPre(remotePreRef.current);
+    remoteHereRef.current = false;
     setScreen("home"); setCallStatus("idle"); setRemoteHere(false);
     setPeerHungUp(false); setRemoteMuted(false); setRemoteCamOff(false);
     setMode(null); setMyCode(""); setJoinVal(""); setFps(0); fpsT.current = [];
