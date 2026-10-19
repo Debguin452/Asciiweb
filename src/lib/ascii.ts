@@ -161,6 +161,8 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
   if (offscreen.width !== drawW) offscreen.width = drawW;
   if (offscreen.height !== drawH) offscreen.height = drawH;
   const ctx = offscreen.getContext("2d", { willReadFrequently: true })!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high"; // proper area-style downscale instead of aliased point-ish sampling
   ctx.save();
   if (mirror) { ctx.scale(-1, 1); ctx.drawImage(source, srcX, srcY, srcW, srcH, -drawW, 0, drawW, drawH); }
   else ctx.drawImage(source, srcX, srcY, srcW, srcH, 0, 0, drawW, drawH);
@@ -217,7 +219,7 @@ function runCore(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiO
   } else {
     for (let i = 0; i < N; i++) { const lum = gray[i]; let idx; if (threshold > 0) { const isLight = lum >= threshold; idx = invert ? (isLight ? 0 : denom) : (isLight ? denom : 0); } else { idx = invert ? Math.floor((1 - lum / 255) * denom) : Math.floor(lum / 255 * denom); if (idx < 0) idx = 0; else if (idx > denom) idx = denom; } charIdx[i] = idx; }
   }
-  if (temporalSmoothing) { if (!pool.smoothed) pool.smoothed = new Float32Array(N); const sm = pool.smoothed; for (let i = 0; i < N; i++) sm[i] = sm[i] * 0.6 + charIdx[i] * 0.4; for (let i = 0; i < N; i++) charIdx[i] = Math.round(sm[i]); }
+  if (temporalSmoothing) { if (!pool.smoothed) pool.smoothed = new Float32Array(N); const sm = pool.smoothed; const snap = Math.max(1, denom * 0.07); for (let i = 0; i < N; i++) { const c = charIdx[i], d = c - sm[i]; sm[i] = d > snap || d < -snap ? c : sm[i] * 0.5 + c * 0.5; charIdx[i] = Math.round(sm[i]); } }
   if (gradientDirs) { const dir = pool.dir; for (let i = 0; i < N; i++) { if (pool.mag[i] > 40) { const deg = ((dir[i] * 180 / Math.PI) + 180) % 180; const li = deg < 22.5 || deg >= 157.5 ? 0 : deg < 67.5 ? 1 : deg < 112.5 ? 2 : 3; charIdx[i] = 0x4000 | li; } } }
   return { w: drawW, h: drawH, chars, nchars, brailleMode: false, blockMode: false, gradientDirs, color, threshold, invert };
 }

@@ -22,8 +22,8 @@ const FLAG_DELTA       = 0x02;
 const FLAG_BLOCK_COLOR = 0x04;
 const FLAG_HAS_PALETTE = 0x08;
 const FLAG_ASCII_COLOR = 0x10;
+const FLAG_V2          = 0x20; // varint gap-coded deltas; palette only when flagged
 
-const DELTA_BREAKEVEN_RATIO = 0.4;
 
 export function bitsNeeded(n: number): number {
   if (n <= 1) return 1;
@@ -74,39 +74,6 @@ export function paletteToRgb(palette: Bytes, colorIndices: Bytes): Bytes {
 }
 
 /** Builds a sparse (position, value) change list. Returns null if too much changed to be worth it. */
-function buildSparseDelta(curr: Bytes, prev: Bytes): { positions: Uint32Array; values: Bytes } | null {
-  const N = curr.length;
-  let changed = 0;
-  for (let i = 0; i < N; i++) if (curr[i] !== prev[i]) changed++;
-  if (changed === 0) return { positions: new Uint32Array(0), values: new Uint8Array(0) };
-  if (changed / N > DELTA_BREAKEVEN_RATIO) return null;
-
-  const positions = new Uint32Array(changed);
-  const values = new Uint8Array(changed);
-  let j = 0;
-  for (let i = 0; i < N; i++) {
-    if (curr[i] !== prev[i]) { positions[j] = i; values[j] = curr[i]; j++; }
-  }
-  return { positions, values };
-}
-
-function writeSparseDelta(out: Bytes, p: number, positions: Uint32Array, values: Bytes): number {
-  const count = positions.length;
-  out[p++] = (count >>> 24) & 0xff;
-  out[p++] = (count >>> 16) & 0xff;
-  out[p++] = (count >>> 8) & 0xff;
-  out[p++] = count & 0xff;
-  for (let i = 0; i < count; i++) {
-    const pos = positions[i];
-    out[p++] = (pos >>> 24) & 0xff;
-    out[p++] = (pos >>> 16) & 0xff;
-    out[p++] = (pos >>> 8) & 0xff;
-    out[p++] = pos & 0xff;
-    out[p++] = values[i];
-  }
-  return p;
-}
-
 function readSparseDelta(data: Bytes, p: number, base: Bytes): number {
   const count = (data[p] << 24 | data[p + 1] << 16 | data[p + 2] << 8 | data[p + 3]) >>> 0;
   p += 4;
@@ -154,13 +121,149 @@ function unpackBits(data: Bytes, offset: number, count: number, bitsPerVal: numb
   return { values, bytesRead: p - offset };
 }
 
+// ───────────────────────── adaptive palette ─────────────────────────
+
+/** Median-cut over a 5-5-5 histogram. Cheap (a few ms for ~10k cells) and far better than a fixed grid. */
+export function buildAdaptivePalette(rgba: ArrayLike<number>, n: number): Bytes {
+  const hist = new Uint32Array(32768);
+  for (let i = 0, o = 0; i < n; i++, o += 4) hist[((rgba[o] >> 3) << 10) | ((rgba[o + 1] >> 3) << 5) | (rgba[o + 2] >> 3)]++;
+  const keys: number[] = [];
+  for (let k = 0; k < 32768; k++) if (hist[k]) keys.push(k);
+  const chan = (k: number, c: number) => c === 0 ? (k >> 10) & 31 : c === 1 ? (k >> 5) & 31 : k & 31;
+  const W = [2, 4, 3]; // perceptual channel weights (R, G, B)
+  const boxes: { lo: number; hi: number; pop: number }[] = [{ lo: 0, hi: keys.length, pop: n }];
+  while (boxes.length < 256) {
+    let bi = -1, best = -1;
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      if (b.hi - b.lo > 1 && b.pop > best) { best = b.pop; bi = i; }
+    }
+    if (bi < 0) break;
+    const b = boxes[bi];
+    const mn = [31, 31, 31], mx = [0, 0, 0];
+    for (let j = b.lo; j < b.hi; j++) for (let c = 0; c < 3; c++) {
+      const v = chan(keys[j], c);
+      if (v < mn[c]) mn[c] = v;
+      if (v > mx[c]) mx[c] = v;
+    }
+    let ch = 0, bestRange = -1;
+    for (let c = 0; c < 3; c++) { const r = (mx[c] - mn[c]) * W[c]; if (r > bestRange) { bestRange = r; ch = c; } }
+    const sub = keys.slice(b.lo, b.hi).sort((x, y) => chan(x, ch) - chan(y, ch));
+    for (let j = 0; j < sub.length; j++) keys[b.lo + j] = sub[j];
+    let acc = 0, mid = b.lo + 1;
+    const half = b.pop / 2;
+    for (let j = b.lo; j < b.hi - 1; j++) { acc += hist[keys[j]]; mid = j + 1; if (acc >= half) break; }
+    boxes.splice(bi, 1, { lo: b.lo, hi: mid, pop: acc }, { lo: mid, hi: b.hi, pop: b.pop - acc });
+  }
+  const pal = new Uint8Array(768);
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    let r = 0, g = 0, bl = 0, pop = 0;
+    for (let j = b.lo; j < b.hi; j++) {
+      const k = keys[j], c = hist[k];
+      r += ((k >> 10) & 31) * c; g += ((k >> 5) & 31) * c; bl += (k & 31) * c; pop += c;
+    }
+    pop = pop || 1;
+    pal[i * 3]     = Math.min(255, Math.round(r / pop) * 8 + 4);
+    pal[i * 3 + 1] = Math.min(255, Math.round(g / pop) * 8 + 4);
+    pal[i * 3 + 2] = Math.min(255, Math.round(bl / pop) * 8 + 4);
+  }
+  return pal;
+}
+
+/** Palette lookup with a lazily-filled 5-5-5 LUT and temporal hysteresis (keeps last frame's index when the pixel barely changed → no sensor-noise flicker, much smaller deltas). */
+export class PaletteMapper {
+  palette: Bytes = new Uint8Array(768);
+  ready = false;
+  private lut = new Int16Array(32768).fill(-1);
+  /** RMS weighted error of the last map() call, for deciding when the palette has gone stale. */
+  lastRms = 0;
+
+  setPalette(p: Bytes) { this.palette = p; this.lut.fill(-1); this.ready = true; }
+
+  private nearest(r: number, g: number, b: number): number {
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    const hit = this.lut[key];
+    if (hit >= 0) return hit;
+    const cr = (key >> 10 & 31) * 8 + 4, cg = (key >> 5 & 31) * 8 + 4, cb = (key & 31) * 8 + 4;
+    const pal = this.palette;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < 256; i++) {
+      const dr = pal[i * 3] - cr, dg = pal[i * 3 + 1] - cg, db = pal[i * 3 + 2] - cb;
+      const d = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    this.lut[key] = best;
+    return best;
+  }
+
+  map(rgba: ArrayLike<number>, n: number, prev: Bytes | null, hysteresis: number, out: Bytes): Bytes {
+    const pal = this.palette;
+    let sumSq = 0;
+    for (let i = 0, o = 0; i < n; i++, o += 4) {
+      const r = rgba[o], g = rgba[o + 1], b = rgba[o + 2];
+      let idx = -1;
+      if (prev) {
+        const pi = prev[i], pr = r - pal[pi * 3], pg = g - pal[pi * 3 + 1], pb = b - pal[pi * 3 + 2];
+        if (2 * pr * pr + 4 * pg * pg + 3 * pb * pb <= hysteresis) idx = pi;
+      }
+      if (idx < 0) idx = this.nearest(r, g, b);
+      out[i] = idx;
+      const er = r - pal[idx * 3], eg = g - pal[idx * 3 + 1], eb = b - pal[idx * 3 + 2];
+      sumSq += 2 * er * er + 4 * eg * eg + 3 * eb * eb;
+    }
+    this.lastRms = Math.sqrt(sumSq / Math.max(1, n));
+    return out;
+  }
+}
+
+// ───────────────────────── varint gap-coded deltas (v2) ─────────────────────────
+
+function buildDeltaV2(curr: ArrayLike<number>, prev: ArrayLike<number>, n: number): Bytes {
+  let changed = 0;
+  for (let i = 0; i < n; i++) if (curr[i] !== prev[i]) changed++;
+  const out = new Uint8Array(5 + changed * 4);
+  let p = 0;
+  let v = changed;
+  while (v >= 128) { out[p++] = (v & 127) | 128; v >>>= 7; }
+  out[p++] = v;
+  let last = -1;
+  for (let i = 0; i < n; i++) {
+    if (curr[i] === prev[i]) continue;
+    let gap = i - last - 1;
+    while (gap >= 128) { out[p++] = (gap & 127) | 128; gap >>>= 7; }
+    out[p++] = gap;
+    out[p++] = curr[i] & 0xff;
+    last = i;
+  }
+  return out.subarray(0, p);
+}
+
+/** Returns the new read offset, or -1 if the data is truncated/corrupt. */
+function readDeltaV2(data: Bytes, p: number, base: Bytes): number {
+  let count = 0, shift = 0, b: number;
+  do { if (p >= data.length) return -1; b = data[p++]; count |= (b & 127) << shift; shift += 7; } while (b & 128);
+  let last = -1;
+  for (let i = 0; i < count; i++) {
+    let gap = 0; shift = 0;
+    do { if (p >= data.length) return -1; b = data[p++]; gap |= (b & 127) << shift; shift += 7; } while (b & 128);
+    if (p >= data.length) return -1;
+    const pos = last + 1 + gap;
+    if (pos >= base.length) return -1;
+    base[pos] = data[p++];
+    last = pos;
+  }
+  return p;
+}
+
 export interface EncodeOpts {
   charIndices: Bytes | null;
   w: number;
   h: number;
   charset: string;
-  colorIndices: Bytes | null;  // already palette-mapped, 0-255 indices
-  palette: Bytes | null;       // 256*3 RGB, only needed on keyframes
+  colorIndices: Bytes | null;  // palette-mapped, 0-255
+  palette: Bytes | null;       // 256*3 RGB — embedded only when sendPalette is true
+  sendPalette: boolean;        // true on first frame / palette rebuild / keyframe requests
   blockColorMode: boolean;     // true = pure color blocks, no char data sent
   prevCharIndices: Bytes | null;
   prevColorIndices: Bytes | null;
@@ -168,156 +271,128 @@ export interface EncodeOpts {
 }
 
 export function encodeFrame(opts: EncodeOpts): ArrayBuffer {
-  const {
-    w, h, charset, colorIndices, palette, blockColorMode,
-    prevCharIndices, prevColorIndices, forceKeyframe,
-  } = opts;
+  const { w, h, charset, colorIndices, palette, blockColorMode, prevCharIndices, prevColorIndices, forceKeyframe } = opts;
   const charIndices = opts.charIndices;
   const N = w * h;
-
-  let flags = 0;
-  if (blockColorMode) flags |= FLAG_BLOCK_COLOR;
-  else if (colorIndices) flags |= FLAG_ASCII_COLOR;
-
-  let charDelta: { positions: Uint32Array; values: Uint8Array } | null = null;
-  let colorDelta: { positions: Uint32Array; values: Uint8Array } | null = null;
-  let isKeyframe = forceKeyframe;
-
-  if (!blockColorMode && charIndices && !forceKeyframe && prevCharIndices && prevCharIndices.length === N) {
-    charDelta = buildSparseDelta(charIndices, prevCharIndices);
-    if (!charDelta) isKeyframe = true;
-  } else if (!blockColorMode) {
-    isKeyframe = true;
-  }
-
-  if (blockColorMode && colorIndices && !forceKeyframe && prevColorIndices && prevColorIndices.length === N) {
-    colorDelta = buildSparseDelta(colorIndices, prevColorIndices);
-    if (!colorDelta) isKeyframe = true;
-  } else if (blockColorMode) {
-    isKeyframe = true;
-  }
-
-  if (isKeyframe) { flags |= FLAG_KEYFRAME; charDelta = null; colorDelta = null; }
-  else flags |= FLAG_DELTA;
-
-  const needsPalette = (blockColorMode || colorIndices) && isKeyframe;
-  if (needsPalette) flags |= FLAG_HAS_PALETTE;
-
   const charsetBytes = blockColorMode ? new Uint8Array(0) : new TextEncoder().encode(charset);
   const bitsPerChar = blockColorMode ? 0 : bitsNeeded(charset.length);
 
+  let charDelta: Bytes | null = null;
+  let colorDelta: Bytes | null = null;
+  let isKeyframe = forceKeyframe || opts.sendPalette;
+
+  if (!isKeyframe) {
+    const needChars = !blockColorMode && !!charIndices;
+    const needColor = !!colorIndices;
+    if ((needChars && (!prevCharIndices || prevCharIndices.length !== N)) || (needColor && (!prevColorIndices || prevColorIndices.length !== N))) {
+      isKeyframe = true;
+    } else {
+      if (needChars) {
+        charDelta = buildDeltaV2(charIndices!, prevCharIndices!, N);
+        if (charDelta.length >= Math.ceil(N * bitsPerChar / 8) * 0.85) isKeyframe = true;
+      }
+      if (needColor && !isKeyframe) {
+        colorDelta = buildDeltaV2(colorIndices!, prevColorIndices!, N);
+        if (colorDelta.length >= N * 0.85) isKeyframe = true;
+      }
+    }
+  }
+  if (isKeyframe) { charDelta = null; colorDelta = null; }
+
+  const embedPalette = !!palette && !!(blockColorMode || colorIndices) && (opts.sendPalette || (isKeyframe && forceKeyframe));
+  let flags = FLAG_V2 | (isKeyframe ? FLAG_KEYFRAME : FLAG_DELTA);
+  if (blockColorMode) flags |= FLAG_BLOCK_COLOR; else if (colorIndices) flags |= FLAG_ASCII_COLOR;
+  if (embedPalette) flags |= FLAG_HAS_PALETTE;
+
   let charSection: Bytes = new Uint8Array(0);
-  if (!blockColorMode && charIndices) {
-    if (charDelta) {
-      const section = new Uint8Array(4 + charDelta.positions.length * 5);
-      writeSparseDelta(section, 0, charDelta.positions, charDelta.values);
-      charSection = section;
-    } else {
-      charSection = packBits(charIndices, bitsPerChar);
-    }
-  }
+  if (!blockColorMode && charIndices) charSection = charDelta ?? packBits(charIndices, bitsPerChar);
+  const colorSection: Bytes = colorIndices ? (colorDelta ?? colorIndices) : new Uint8Array(0);
 
-  let paletteSection: Bytes = new Uint8Array(0);
-  if (needsPalette && palette) paletteSection = palette;
-
-  let colorSection: Bytes = new Uint8Array(0);
-  if (colorIndices) {
-    if (blockColorMode && colorDelta) {
-      const section = new Uint8Array(4 + colorDelta.positions.length * 5);
-      writeSparseDelta(section, 0, colorDelta.positions, colorDelta.values);
-      colorSection = section;
-    } else {
-      colorSection = colorIndices;
-    }
-  }
-
-  const fixedHeader = 1 /*flags*/ + 2 /*w*/ + 2 /*h*/ + 1 /*charsetLen*/ + charsetBytes.length;
-  const paletteHeader = paletteSection.length > 0 ? 2 : 0;
-
-  const totalSize = fixedHeader + charSection.length + paletteHeader + paletteSection.length + colorSection.length;
-  const out = new Uint8Array(totalSize);
+  const paletteLen = embedPalette ? palette!.length : 0;
+  const total = 6 + charsetBytes.length + charSection.length + (paletteLen ? 2 + paletteLen : 0) + colorSection.length;
+  const out = new Uint8Array(total);
   let p = 0;
-
   out[p++] = flags;
-  out[p++] = (w >> 8) & 0xff;
-  out[p++] = w & 0xff;
-  out[p++] = (h >> 8) & 0xff;
-  out[p++] = h & 0xff;
+  out[p++] = (w >> 8) & 0xff; out[p++] = w & 0xff;
+  out[p++] = (h >> 8) & 0xff; out[p++] = h & 0xff;
   out[p++] = charsetBytes.length;
   out.set(charsetBytes, p); p += charsetBytes.length;
-
   out.set(charSection, p); p += charSection.length;
-
-  if (paletteSection.length > 0) {
-    out[p++] = (paletteSection.length >> 8) & 0xff;
-    out[p++] = paletteSection.length & 0xff;
-    out.set(paletteSection, p); p += paletteSection.length;
+  if (paletteLen) {
+    out[p++] = (paletteLen >> 8) & 0xff; out[p++] = paletteLen & 0xff;
+    out.set(palette!, p); p += paletteLen;
   }
-
   out.set(colorSection, p);
-
   return out.buffer;
 }
 
+/** Returns null when the frame can't be decoded against `prevFrame` (missing/mismatched base, truncated data) — the caller should request a keyframe. */
 export function decode(buffer: ArrayBuffer, prevFrame: RemoteFrame | null): RemoteFrame | null {
   const data: Bytes = new Uint8Array(buffer);
   if (data.length < 6) return null;
 
   let p = 0;
   const flags        = data[p++];
-  const isKeyframe    = (flags & FLAG_KEYFRAME) !== 0;
-  const isDelta       = (flags & FLAG_DELTA) !== 0;
-  const isBlockColor  = (flags & FLAG_BLOCK_COLOR) !== 0;
-  const hasPalette    = (flags & FLAG_HAS_PALETTE) !== 0;
+  const isKeyframe   = (flags & FLAG_KEYFRAME) !== 0;
+  const isDelta      = (flags & FLAG_DELTA) !== 0;
+  const isBlockColor = (flags & FLAG_BLOCK_COLOR) !== 0;
+  const hasPalette   = (flags & FLAG_HAS_PALETTE) !== 0;
   const hasAsciiColor = (flags & FLAG_ASCII_COLOR) !== 0;
+  const isV2         = (flags & FLAG_V2) !== 0;
 
   const w = (data[p++] << 8) | data[p++];
   const h = (data[p++] << 8) | data[p++];
   const N = w * h;
+  if (!N || N > 1 << 20) return null;
 
   const charsetLen = data[p++];
   if (p + charsetLen > data.length) return null;
-  const charset = isBlockColor ? "" : new TextDecoder().decode(data.slice(p, p + charsetLen));
+  const charset = isBlockColor ? "" : new TextDecoder().decode(data.subarray(p, p + charsetLen));
   p += charsetLen;
+
+  const baseOk = !!prevFrame && prevFrame.w === w && prevFrame.h === h;
+  if (isDelta && !baseOk) return null;
 
   let charIndices: Bytes;
   if (isBlockColor) {
-    charIndices = prevFrame?.charIndices?.length === N ? new Uint8Array(prevFrame.charIndices) : new Uint8Array(N);
+    charIndices = baseOk ? prevFrame!.charIndices : new Uint8Array(N);
+  } else if (isDelta) {
+    charIndices = new Uint8Array(prevFrame!.charIndices);
+    if (isV2) { p = readDeltaV2(data, p, charIndices); if (p < 0) return null; }
+    else p = readSparseDelta(data, p, charIndices);
   } else {
-    const bitsPerChar = bitsNeeded(charset.length);
-    if (isDelta) {
-      charIndices = prevFrame?.charIndices?.length === N ? new Uint8Array(prevFrame.charIndices) : new Uint8Array(N);
-      p = readSparseDelta(data, p, charIndices);
-    } else {
-      const { values, bytesRead } = unpackBits(data, p, N, bitsPerChar);
-      charIndices = values;
-      p += bytesRead;
-    }
+    const { values, bytesRead } = unpackBits(data, p, N, bitsNeeded(charset.length));
+    charIndices = values;
+    p += bytesRead;
   }
 
   let palette: Bytes | null = null;
-  if (hasPalette && p + 2 <= data.length) {
+  if (hasPalette) {
+    if (p + 2 > data.length) return null;
     const paletteLen = (data[p] << 8) | data[p + 1];
     p += 2;
-    if (paletteLen > 0 && p + paletteLen <= data.length) {
-      palette = new Uint8Array(data.slice(p, p + paletteLen));
-      p += paletteLen;
-    }
+    if (paletteLen === 0 || p + paletteLen > data.length) return null;
+    palette = new Uint8Array(data.slice(p, p + paletteLen));
+    p += paletteLen;
   } else if ((isBlockColor || hasAsciiColor) && prevFrame?.palette) {
     palette = prevFrame.palette;
   }
 
   let colorIndices: Bytes | null = null;
-  if (isBlockColor) {
-    colorIndices = prevFrame?.colorIndices?.length === N ? new Uint8Array(prevFrame.colorIndices) : new Uint8Array(N);
-    if (isDelta) {
+  if (isBlockColor || hasAsciiColor) {
+    if (!palette) return null;
+    if (isDelta && isV2) {
+      if (!prevFrame!.colorIndices) return null;
+      colorIndices = new Uint8Array(prevFrame!.colorIndices);
+      if (readDeltaV2(data, p, colorIndices) < 0) return null;
+    } else if (isDelta) {
+      if (!prevFrame!.colorIndices) return null;
+      colorIndices = new Uint8Array(prevFrame!.colorIndices);
       readSparseDelta(data, p, colorIndices);
-    } else if (p + N <= data.length) {
-      colorIndices.set(data.subarray(p, p + N));
+    } else {
+      if (p + N > data.length) return null;
+      colorIndices = data.slice(p, p + N);
     }
-  } else if (hasAsciiColor && palette) {
-    colorIndices = new Uint8Array(N);
-    for (let i = 0; i < N && p < data.length; i++) colorIndices[i] = data[p++];
   }
 
   return { w, h, charset, charIndices, palette, colorIndices, isKeyframe, isBlockColor, timestamp: performance.now() };

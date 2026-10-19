@@ -1,9 +1,8 @@
 import Peer, { type DataConnection, type MediaConnection } from "peerjs";
-import { encodeFrame, decode, toArrayBuffer, mapToPalette, generatePalette, type RemoteFrame } from "./binary";
 import {
-  isWasmAvailable, writePixelsToWasm, wasmMapToPalette, readWasmColorIndices,
-  wasmGeneratePalette, readWasmPalette,
-} from "./wasm-wrapper";
+  encodeFrame, decode, toArrayBuffer, mapToPalette, generatePalette,
+  buildAdaptivePalette, PaletteMapper, type RemoteFrame,
+} from "./binary";
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
 // that was the Cloudflare-billed path, skipped in favor of this) or its
@@ -72,6 +71,13 @@ async function fetchIceServers(): Promise<RTCIceServer[]> {
   return FALLBACK_ICE_SERVERS;
 }
 
+/** The call's media leg only needs audio — the picture travels as ASCII over the data channel. Sending the camera track as well wasted
+ *  upload bandwidth and a full video-encoder's worth of CPU competing with the frame stream. */
+function audioOnly(stream: MediaStream): MediaStream {
+  const a = stream.getAudioTracks();
+  return a.length ? new MediaStream(a) : stream;
+}
+
 const RECONNECT_DELAY = 1500;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
@@ -91,17 +97,19 @@ export interface CallQualityStep {
 // dropped them outright (while an always-full-size keyframe still went out
 // every keyframeInterval regardless, since dispatch() never size-gates
 // keyframes). Scaling resolution down with quality keeps keyframes cheap too.
+// Frame rates are capped at what cameras actually deliver (≤30) — computing and sending 48-60 "frames"
+// per second only re-processed duplicate camera frames. The budget goes into grid resolution instead.
 const QUALITY_STEPS: Record<CallQualityLevel, CallQualityStep> = {
-  low:    { keyframeInterval: 90, targetFps: 12, maxFrameSize: 4000,  resScale: 0.45 },
-  medium: { keyframeInterval: 60, targetFps: 24, maxFrameSize: 8000,  resScale: 0.65 },
-  high:   { keyframeInterval: 45, targetFps: 36, maxFrameSize: 16000, resScale: 0.85 },
-  ultra:  { keyframeInterval: 30, targetFps: 48, maxFrameSize: 32000, resScale: 1.0  },
-  max:    { keyframeInterval: 24, targetFps: 60, maxFrameSize: 65000, resScale: 1.0  },
+  low:    { keyframeInterval: 60, targetFps: 10, maxFrameSize: 6000,  resScale: 0.5  },
+  medium: { keyframeInterval: 60, targetFps: 15, maxFrameSize: 12000, resScale: 0.7  },
+  high:   { keyframeInterval: 60, targetFps: 20, maxFrameSize: 24000, resScale: 0.85 },
+  ultra:  { keyframeInterval: 60, targetFps: 24, maxFrameSize: 40000, resScale: 1.0  },
+  max:    { keyframeInterval: 60, targetFps: 30, maxFrameSize: 60000, resScale: 1.0  },
 };
 
 const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra", "max"];
 
-const BUFFERED_AMOUNT_LOW_THRESHOLD = 256 * 1024;
+const BUFFERED_AMOUNT_LOW_THRESHOLD = 96 * 1024;
 const BUFFERED_AMOUNT_CRITICAL = 1024 * 1024;
 
 
@@ -140,6 +148,14 @@ export class CallManager {
   private prevSentIndices: Uint8Array | null = null;
   private prevSentColorIdx: Uint8Array | null = null;
   private prevRecvFrame: RemoteFrame | null = null;
+  private mapper = new PaletteMapper();
+  private framesSinceKey = 0;
+  private needKeyframe = true;
+  private lastKfRequestAt = 0;
+  private rtt = 0;
+  private rttBase = 0;
+  private rttSamples: number[] = [];
+  private consecutiveDrops = 0;
   private frameCount = 0;
   // Starting at "ultra" (48fps, full resolution, the biggest frames) meant
   // every call began by blasting the most demanding setting a phone's
@@ -162,7 +178,6 @@ export class CallManager {
   private qualityLevel: CallQualityLevel = "medium";
   private recentSends = 0;
   private recentDrops = 0;
-  private recentLatencies: number[] = [];
   private qualityCheckCounter = 0;
   private consecutiveGood = 0;
   private consecutiveBad = 0;
@@ -179,7 +194,7 @@ export class CallManager {
   // case ourselves instead of hanging forever with a "connected" UI.
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastRecvAt = 0;
-  private readonly HEARTBEAT_INTERVAL = 3000;
+  private readonly HEARTBEAT_INTERVAL = 1000;
   private readonly STALE_TIMEOUT = 9000;
 
   constructor(events: CallManagerEvents) {
@@ -215,7 +230,7 @@ export class CallManager {
         this.isHost = true;
         this.attachMedia(call);
         if (this.localStream) {
-          call.answer(this.localStream);
+          call.answer(audioOnly(this.localStream));
         } else {
           this.pendingIncomingCall = call;
         }
@@ -278,9 +293,9 @@ export class CallManager {
     if (this.pendingIncomingCall) {
       const call = this.pendingIncomingCall;
       this.pendingIncomingCall = null;
-      call.answer(stream);
+      call.answer(audioOnly(stream));
     } else if (this.mediaConn && this.mediaConn.open === false) {
-      this.mediaConn.answer(stream);
+      this.mediaConn.answer(audioOnly(stream));
     }
   }
 
@@ -296,44 +311,56 @@ export class CallManager {
     this.attachData(conn);
 
     if (stream) {
-      const call = this.peer.call(id, stream);
+      const call = this.peer.call(id, audioOnly(stream));
       this.mediaConn = call;
       this.attachMedia(call);
     }
   }
 
-  private adaptQuality() {
-    const dropRate   = this.recentSends > 0 ? this.recentDrops / this.recentSends : 0;
-    const avgLatency = this.recentLatencies.length > 0
-      ? this.recentLatencies.reduce((a, b) => a + b, 0) / this.recentLatencies.length
-      : 0;
-    const buffered = this.dataConn?.dataChannel?.bufferedAmount ?? 0;
+  private onRtt(ms: number) {
+    this.rtt = this.rtt ? this.rtt * 0.7 + ms * 0.3 : ms;
+    this.rttSamples.push(ms);
+    if (this.rttSamples.length > 30) this.rttSamples.shift();
+    this.rttBase = Math.min(...this.rttSamples);
+  }
 
+  private requestKeyframe() {
+    const now = performance.now();
+    if (now - this.lastKfRequestAt < 400 || !this.dataConn?.open) return;
+    this.lastKfRequestAt = now;
+    try { this.dataConn.send({ type: "kf" }); } catch { /* noop */ }
+  }
+
+  private adaptQuality() {
+    const dropRate = this.recentSends > 0 ? this.recentDrops / this.recentSends : 0;
+    const buffered = this.dataConn?.dataChannel?.bufferedAmount ?? 0;
     const idx = QUALITY_ORDER.indexOf(this.qualityLevel);
     if (idx === -1) return;
 
-    const congested = buffered > BUFFERED_AMOUNT_LOW_THRESHOLD || dropRate > 0.15 || avgLatency > 150;
-    const healthy   = buffered === 0 && dropRate < 0.03 && avgLatency < 60;
+    // RTT rides the same ordered channel as the frames, so it includes our own send-queue delay — a real congestion signal,
+    // unlike timing a synchronous send() (which is always ~0).
+    const rttKnown = this.rtt > 0;
+    const congested = buffered > BUFFERED_AMOUNT_LOW_THRESHOLD || dropRate > 0.2 || (rttKnown && this.rtt > this.rttBase * 2.5 + 120);
+    const healthy   = buffered < 16 * 1024 && dropRate < 0.05 && (!rttKnown || this.rtt < this.rttBase * 1.7 + 60);
 
     if (congested && idx > 0) {
       this.consecutiveBad++;
       this.consecutiveGood = 0;
       const severe = buffered > BUFFERED_AMOUNT_CRITICAL;
       if (this.consecutiveBad >= (severe ? 1 : 2)) {
-        const next = QUALITY_ORDER[Math.max(0, idx - (severe ? 2 : 1))];
-        this.setQuality(next);
+        this.setQuality(QUALITY_ORDER[Math.max(0, idx - (severe ? 2 : 1))]);
         this.consecutiveBad = 0;
       }
     } else if (healthy && idx < QUALITY_ORDER.length - 1) {
       this.consecutiveGood++;
       this.consecutiveBad = 0;
-      if (this.consecutiveGood >= 2) {
+      if (this.consecutiveGood >= 3) {
         this.consecutiveGood = 0;
         this.setQuality(QUALITY_ORDER[idx + 1]);
       }
     } else {
       this.consecutiveBad = 0;
-      this.consecutiveGood = 0;
+      if (!healthy) this.consecutiveGood = 0;
     }
   }
 
@@ -374,13 +401,16 @@ export class CallManager {
     conn.on("data", (data: unknown) => {
       this.lastRecvAt = performance.now();
 
-      if (data && typeof data === "object" && "type" in (data as Record<string, unknown>)) {
-        const st = data as { type: string; micMuted: boolean; camOff: boolean };
-        if (st.type === "ping") return; // liveness only, nothing to render
-        if (st.type === "state") {
-          this.events.onRemoteState?.({ micMuted: st.micMuted, camOff: st.camOff });
+      if (data && typeof data === "object" && "type" in (data as Record<string, unknown>) && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
+        const m = data as { type: string; t?: number; micMuted?: boolean; camOff?: boolean };
+        if (m.type === "ping") { try { conn.send({ type: "pong", t: m.t }); } catch { /* noop */ } return; }
+        if (m.type === "pong") { if (typeof m.t === "number") this.onRtt(performance.now() - m.t); return; }
+        if (m.type === "kf") { this.needKeyframe = true; return; }
+        if (m.type === "state") {
+          this.events.onRemoteState?.({ micMuted: !!m.micMuted, camOff: !!m.camOff });
           return;
         }
+        return;
       }
 
       const buf = toArrayBuffer(data);
@@ -392,6 +422,8 @@ export class CallManager {
             this.prevRecvFrame = frame;
             this.events.onRemoteFrame(frame);
           }
+        } else {
+          this.requestKeyframe();
         }
       }
     });
@@ -431,7 +463,7 @@ export class CallManager {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this.dataConn?.open) return;
-      try { this.dataConn.send({ type: "ping" }); } catch { /* noop — next tick or iceStateChanged will catch a truly dead channel */ }
+      try { this.dataConn.send({ type: "ping", t: performance.now() }); } catch { /* noop — next tick or iceStateChanged will catch a truly dead channel */ }
 
       const now = performance.now();
       if (now - this.lastRecvAt > this.STALE_TIMEOUT) {
@@ -460,9 +492,17 @@ export class CallManager {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
+  /** True when a new frame should be produced now. Callers check this BEFORE doing capture/convert work, so no CPU is spent on frames that would be throttled away. */
+  isSendDue(): boolean {
+    if (!this.dataConn?.open) return false;
+    const now = performance.now();
+    if (this.lastSentAt > 0 && now - this.lastSentAt < 1000 / this.targetFps - 2) return false;
+    return (this.dataConn?.dataChannel?.bufferedAmount ?? 0) <= BUFFERED_AMOUNT_CRITICAL;
+  }
+
   /** ASCII mode — sends character indices, optionally with per-cell color. */
   sendAsciiFrame(
-    charIndices: Uint8Array,
+    charIndices: ArrayLike<number>,
     w: number, h: number,
     charset: string,
     rgbColors: Uint8Array | null
@@ -471,9 +511,10 @@ export class CallManager {
     if (!this.throttle()) return;
 
     this.frameCount++;
-    const forceKeyframe = this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
-
+    const forceKeyframe = this.shouldForceKeyframe();
     const N = w * h;
+    const chars = charIndices instanceof Uint8Array ? charIndices : Uint8Array.from(charIndices as ArrayLike<number>);
+
     let colorIndices: Uint8Array | null = null;
     let palette: Uint8Array | null = null;
     if (rgbColors && rgbColors.length === N * 3) {
@@ -487,61 +528,49 @@ export class CallManager {
     const prevColor = !forceKeyframe && this.prevSentColorIdx?.length === N ? this.prevSentColorIdx : null;
 
     const buf = encodeFrame({
-      w, h, charset, colorIndices, palette,
-      charIndices, blockColorMode: false,
+      w, h, charset, colorIndices, palette, sendPalette: forceKeyframe && !!palette,
+      charIndices: chars, blockColorMode: false,
       prevCharIndices: prevChar, prevColorIndices: prevColor,
       forceKeyframe,
     });
 
-    this.dispatch(buf, charIndices, colorIndices, forceKeyframe);
+    this.dispatch(buf, chars, colorIndices, forceKeyframe);
   }
 
-  /** Color-block mode — sends only color data, no character indices at all. rgba is a Uint8ClampedArray/Uint8Array of w*h*4 RGBA bytes (alpha ignored). */
+  private shouldForceKeyframe(): boolean {
+    const force = this.needKeyframe || this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
+    return force;
+  }
+
+  /** Color-block mode — sends only color data. rgba is w*h*4 RGBA bytes (alpha ignored). */
   sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
 
     this.frameCount++;
-    const forceKeyframe = this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
     const N = w * h;
+    let forceKeyframe = this.shouldForceKeyframe() || !this.mapper.ready || this.prevSentColorIdx?.length !== N;
+    const out = new Uint8Array(N);
 
-    let colorIndices: Uint8Array;
-    let palette: Uint8Array | null = null;
-
-    if (isWasmAvailable()) {
-      try {
-        writePixelsToWasm(rgba, N);
-        wasmMapToPalette(w, h);
-        colorIndices = new Uint8Array(readWasmColorIndices(N)); // copy out — readWasm* views are only valid until the next WASM call
-        if (forceKeyframe) {
-          wasmGeneratePalette();
-          palette = readWasmPalette();
-        }
-      } catch {
-        colorIndices = this.colorIndicesFromRgbaJs(rgba, N);
-        if (forceKeyframe) palette = generatePalette(256);
-      }
-    } else {
-      colorIndices = this.colorIndicesFromRgbaJs(rgba, N);
-      if (forceKeyframe) palette = generatePalette(256);
+    if (!forceKeyframe) {
+      this.mapper.map(rgba, N, this.prevSentColorIdx, 324, out);
+      // Palette has drifted (lighting change, new scene): rebuild it as a keyframe rather than smearing 256 stale colors.
+      if (this.mapper.lastRms > 26 && this.framesSinceKey >= 8) forceKeyframe = true;
+    }
+    if (forceKeyframe) {
+      this.mapper.setPalette(buildAdaptivePalette(rgba, N));
+      this.mapper.map(rgba, N, null, 0, out);
     }
 
-    const prevColor = !forceKeyframe && this.prevSentColorIdx?.length === N ? this.prevSentColorIdx : null;
-
+    const prevColor = !forceKeyframe ? this.prevSentColorIdx : null;
     const buf = encodeFrame({
-      w, h, charset: "", colorIndices, palette,
+      w, h, charset: "", colorIndices: out, palette: this.mapper.palette, sendPalette: forceKeyframe,
       charIndices: null, blockColorMode: true,
       prevCharIndices: null, prevColorIndices: prevColor,
       forceKeyframe,
     });
 
-    this.dispatch(buf, null, colorIndices, forceKeyframe);
-  }
-
-  private colorIndicesFromRgbaJs(rgba: Uint8ClampedArray | Uint8Array, N: number): Uint8Array {
-    const r = new Uint8Array(N), g = new Uint8Array(N), b = new Uint8Array(N);
-    for (let i = 0; i < N; i++) { r[i] = rgba[i * 4]; g[i] = rgba[i * 4 + 1]; b[i] = rgba[i * 4 + 2]; }
-    return mapToPalette(r, g, b);
+    this.dispatch(buf, null, out, forceKeyframe);
   }
 
   private throttle(): boolean {
@@ -562,23 +591,23 @@ export class CallManager {
     if (buf.byteLength > this.maxFrameSize && !forceKeyframe) {
       this.recentDrops++;
       this.qualityCheckCounter++;
+      if (++this.consecutiveDrops >= 4) { this.consecutiveDrops = 0; this.setQuality(QUALITY_ORDER[Math.max(0, QUALITY_ORDER.indexOf(this.qualityLevel) - 1)]); }
       if (this.qualityCheckCounter >= this.CHECK_FRAMES) { this.adaptQuality(); this.qualityCheckCounter = 0; this.recentSends = 0; this.recentDrops = 0; }
       return;
     }
 
     this.recentSends++;
-    const sendStart = performance.now();
 
     try {
       this.dataConn.send(buf);
-      const latency = performance.now() - sendStart;
-      this.recentLatencies.push(latency);
-      if (this.recentLatencies.length > 20) this.recentLatencies.shift();
 
       this.prevSentIndices   = charIndices ? new Uint8Array(charIndices) : null;
       this.prevSentColorIdx  = colorIndices ? new Uint8Array(colorIndices) : null;
+      this.consecutiveDrops = 0;
+      if (forceKeyframe) { this.needKeyframe = false; this.framesSinceKey = 0; } else this.framesSinceKey++;
     } catch {
       this.recentDrops++;
+      this.needKeyframe = true; // sender/receiver bases may now disagree — resync with a full frame
     }
 
     this.qualityCheckCounter++;
@@ -619,14 +648,11 @@ export class CallManager {
   getMyId(): string { return this.myId; }
 
   getStats() {
-    const avgLatency = this.recentLatencies.length > 0
-      ? this.recentLatencies.reduce((a, b) => a + b, 0) / this.recentLatencies.length
-      : 0;
     return {
       quality: this.qualityLevel,
       fps: this.targetFps,
       keyframeInterval: this.keyframeInterval,
-      latency: Math.round(avgLatency),
+      latency: Math.round(this.rtt),
       drops: this.recentDrops,
     };
   }
