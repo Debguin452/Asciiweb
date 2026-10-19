@@ -50,8 +50,24 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "about",   label: "About"   },
 ];
 
+// ── Tiny path router (no dependency): /camera /image /library /call /about, plus invite links /call/CODE (alias /join/CODE).
+const TAB_IDS: Tab[] = ["camera", "image", "library", "call", "about"];
+
+function parsePath(): { tab: Tab; code: string } {
+  const parts = window.location.pathname.split("/").filter(Boolean);
+  const head = (parts[0] ?? "").toLowerCase();
+  const rawCode = (parts[1] ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (head === "join") return { tab: "call", code: rawCode };
+  const tab = (TAB_IDS as string[]).includes(head) ? (head as Tab) : "camera";
+  return { tab, code: tab === "call" ? rawCode : "" };
+}
+
+const pathFor = (tab: Tab, code = "") => (tab === "call" && code ? `/call/${code}` : `/${tab}`);
+
 export default function App() {
-  const [tab,       setTab]       = useState<Tab>("camera");
+  const initial = useState(parsePath)[0];
+  const [tab,       setTabState]  = useState<Tab>(initial.tab);
+  const [inviteCode, setInviteCode] = useState(initial.code);
   const [theme,     setTheme]     = useState<ThemeName>("green");
   const [themeOpen, setThemeOpen] = useState(false);
   const [opts,      setOpts]      = useState<AsciiOptions>({ ...DEFAULT_OPTIONS });
@@ -61,6 +77,25 @@ export default function App() {
   const [editItem,  setEditItem]  = useState<LibraryItem | null>(null);
   const themeRef    = useRef<HTMLDivElement>(null);
   const prevIsLight = useRef(false);
+
+  const navigate = (next: Tab, code = "", replace = false) => {
+    const path = pathFor(next, code);
+    if (window.location.pathname !== path) window.history[replace ? "replaceState" : "pushState"](null, "", path + window.location.hash);
+    setTabState(next); setInviteCode(code);
+  };
+  const setTab = (t: Tab) => navigate(t);
+
+  useEffect(() => {
+    // Normalise "/" (and unknown paths) to the real tab URL, and follow back/forward.
+    const { tab: t, code } = parsePath();
+    const canonical = pathFor(t, code);
+    if (window.location.pathname !== canonical) window.history.replaceState(null, "", canonical + window.location.hash);
+    const onPop = () => { const p = parsePath(); setTabState(p.tab); setInviteCode(p.code); };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  useEffect(() => { document.title = `asciiweb — ${tab}`; }, [tab]);
 
   const updateOpt = <K extends keyof AsciiOptions>(key: K, val: AsciiOptions[K]) =>
     setOpts(o => ({ ...o, [key]: val }));
@@ -134,7 +169,7 @@ export default function App() {
         {tab === "camera"  && <CameraTab  opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} exportFg={exportFg} onExportFgChange={setExportFg} />}
         {tab === "image"   && <ImageTab   opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} editItem={editItem} onEditDone={() => setEditItem(null)} exportFg={exportFg} onExportFgChange={setExportFg} />}
         {tab === "library" && <LibraryTab fontSize={fontSize} refreshKey={libKey} onEdit={item => { setEditItem(item); setTab("image"); }} />}
-        {tab === "call"    && <CallTab    opts={opts} updateOpt={updateOpt} />}
+        {tab === "call"    && <CallTab    opts={opts} updateOpt={updateOpt} inviteCode={inviteCode} onInviteConsumed={() => navigate("call", "", true)} />}
         {tab === "about"   && <AboutTab />}
       </main>
     </div>

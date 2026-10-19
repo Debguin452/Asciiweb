@@ -810,6 +810,19 @@ html, body, #root {
 }
 .call-copy-btn:hover { color: var(--fg); border-color: var(--fg-dim); }
 
+.call-copy-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+.call-invite-note {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--fg);
+  border: 1px solid var(--fg-dim);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
 .call-wait-hint {
   font-size: 10px;
   color: var(--fg-faint);
