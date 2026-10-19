@@ -7,18 +7,24 @@ import {
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
 // that was the Cloudflare-billed path, skipped in favor of this) or its
-// fetch fails for any other reason. ExpressTURN's free-tier credentials are
-// static/account-scoped (not a per-session secret), and their own docs say
-// that's fine to use directly in client code for this tier — see
-// https://www.expressturn.com/docs/peerjs. This replaces the old
-// turn:openrelay.metered.ca entries, which used a widely shared,
-// unauthenticated free demo credential (openrelayproject/openrelayproject)
-// copied into countless WebRTC tutorials — exactly the kind of overloaded/
-// rate-limited shared endpoint that was the leading suspect for "mostly
-// fails to connect, works by luck" on mobile data or behind strict/
-// corporate NATs (TURN relay is specifically what's needed there; STUN
-// alone isn't enough). The plain stun:* entries stay as extra, free,
-// unauthenticated candidate sources regardless.
+// fetch fails for any other reason. The browser tries every TURN entry
+// given to it and uses whichever actually gets through, so listing more
+// than one TURN provider is pure upside, not a tradeoff — it's kept
+// deliberately redundant across BOTH provider and port/transport:
+//   - ExpressTURN (free, account-scoped static credentials — their own
+//     docs confirm that's fine for this tier, see
+//     https://www.expressturn.com/docs/peerjs) on port 3478, UDP + TCP.
+//   - The openrelay.metered.ca demo credential on ports 80 and 443,
+//     UDP + TCP. It's a widely shared, unauthenticated free demo pair
+//     (openrelayproject/openrelayproject) copied into countless WebRTC
+//     tutorials, so it's not trusted alone — but it's free, and critically
+//     it covers port 443, which ExpressTURN's free tier doesn't confirm.
+// Some mobile carriers and corporate firewalls block non-standard UDP
+// ports outright (3478 included) while leaving 443 open, since that's
+// also plain HTTPS traffic — so having a 443 option matters independently
+// of which provider's relay actually ends up being used. The plain
+// stun:* entries stay as extra, free, unauthenticated candidate sources
+// regardless of all of the above.
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
@@ -32,6 +38,10 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
     username: "000000002107743162",
     credential: "PDWdMB8cuWFugJUzH8rdv6hCUnY=",
   },
+  { urls: "stun:openrelay.metered.ca:80" },
+  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
 ];
 
 // Cached across calls in the same page session — no need to re-fetch fresh
