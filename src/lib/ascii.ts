@@ -229,6 +229,12 @@ const _rgbCache = new Map<number, string>();
 function rgbStr(r: number, g: number, b: number): string { const k = (r << 16) | (g << 8) | b; let s = _rgbCache.get(k); if (!s) { s = `rgb(${r},${g},${b})`; if (_rgbCache.size < 32768) _rgbCache.set(k, s); } return s; }
 function escChar(s: string): string { return s === "&" ? "&amp;" : s === "<" ? "&lt;" : s === ">" ? "&gt;" : s; }
 
+/** Runs the full conversion but only fills the shared pool (char indices + RGB planes) — no string building. */
+export function renderToPool(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean): { w: number; h: number; chars: string } | null {
+  const core = runCore(source, offscreen, opts, mirror);
+  return core ? { w: core.w, h: core.h, chars: core.chars } : null;
+}
+
 export function renderToString(source: AsciiSource, offscreen: HTMLCanvasElement, opts: AsciiOptions, mirror: boolean, mode: "html" | "text", crop?: { x: number; y: number; w: number; h: number }): { html: string; isColor: boolean } | null {
   const core = runCore(source, offscreen, opts, mirror, crop);
   if (!core) return null;

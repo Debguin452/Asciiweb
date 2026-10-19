@@ -1,7 +1,6 @@
 import Peer, { type DataConnection, type MediaConnection } from "peerjs";
 import {
-  encodeFrame, decode, toArrayBuffer, mapToPalette, generatePalette,
-  buildAdaptivePalette, PaletteMapper, type RemoteFrame,
+  encodeFrame, decode, toArrayBuffer, ColorQuantizer, type RemoteFrame,
 } from "./binary";
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
@@ -148,7 +147,9 @@ export class CallManager {
   private prevSentIndices: Uint8Array | null = null;
   private prevSentColorIdx: Uint8Array | null = null;
   private prevRecvFrame: RemoteFrame | null = null;
-  private mapper = new PaletteMapper();
+  private quant = new ColorQuantizer();
+  private curChars = new Uint8Array(0); // reused per-frame scratch (no per-frame allocations on the hot path)
+  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = pixel; a change forces a keyframe (+palette)
   private framesSinceKey = 0;
   private needKeyframe = true;
   private lastKfRequestAt = 0;
@@ -500,41 +501,68 @@ export class CallManager {
     return (this.dataConn?.dataChannel?.bufferedAmount ?? 0) <= BUFFERED_AMOUNT_CRITICAL;
   }
 
-  /** ASCII mode — sends character indices, optionally with per-cell color. */
-  sendAsciiFrame(
-    charIndices: ArrayLike<number>,
-    w: number, h: number,
-    charset: string,
-    rgbColors: Uint8Array | null
-  ) {
+  private scratchChars(src: ArrayLike<number>, n: number): Uint8Array {
+    if (this.curChars.length !== n) this.curChars = new Uint8Array(n);
+    const dst = this.curChars;
+    for (let i = 0; i < n; i++) dst[i] = src[i] & 0xff;
+    return dst;
+  }
+
+  /** True (once per change) when the stream switched between ascii / colored ascii / pixel — the receiver needs a self-contained keyframe. */
+  private kindChanged(kind: number): boolean {
+    const changed = this.lastKind !== kind;
+    this.lastKind = kind;
+    return changed;
+  }
+
+  /** Plain ASCII mode — sends character indices only. */
+  sendAsciiFrame(charIndices: ArrayLike<number>, w: number, h: number, charset: string) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
 
     this.frameCount++;
-    const forceKeyframe = this.shouldForceKeyframe();
     const N = w * h;
-    const chars = charIndices instanceof Uint8Array ? charIndices : Uint8Array.from(charIndices as ArrayLike<number>);
-
-    let colorIndices: Uint8Array | null = null;
-    let palette: Uint8Array | null = null;
-    if (rgbColors && rgbColors.length === N * 3) {
-      const r = new Uint8Array(N), g = new Uint8Array(N), b = new Uint8Array(N);
-      for (let i = 0; i < N; i++) { r[i] = rgbColors[i * 3]; g[i] = rgbColors[i * 3 + 1]; b[i] = rgbColors[i * 3 + 2]; }
-      colorIndices = mapToPalette(r, g, b);
-      palette = generatePalette(256);
-    }
-
-    const prevChar  = !forceKeyframe && this.prevSentIndices?.length === N ? this.prevSentIndices : null;
-    const prevColor = !forceKeyframe && this.prevSentColorIdx?.length === N ? this.prevSentColorIdx : null;
+    const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(1);
+    const chars = this.scratchChars(charIndices, N);
 
     const buf = encodeFrame({
-      w, h, charset, colorIndices, palette, sendPalette: forceKeyframe && !!palette,
+      w, h, charset, colorIndices: null, palette: null, sendPalette: false,
       charIndices: chars, blockColorMode: false,
-      prevCharIndices: prevChar, prevColorIndices: prevColor,
+      prevCharIndices: !forceKeyframe && this.prevSentIndices?.length === N ? this.prevSentIndices : null,
+      prevColorIndices: null,
       forceKeyframe,
     });
+    this.dispatch(buf, chars, null, forceKeyframe);
+  }
 
-    this.dispatch(buf, chars, colorIndices, forceKeyframe);
+  /**
+   * Colored ASCII mode — character indices plus an adaptive 256-color palette index per cell.
+   * `rgba` is w*h*4 (already brightness-lifted, see fillLiftedRgba). Returns what was actually sent
+   * (so the local preview shows exactly what the peer sees), or null if the frame was throttled.
+   */
+  sendAsciiColorFrame(
+    charIndices: ArrayLike<number>, w: number, h: number, charset: string,
+    rgba: Uint8ClampedArray | Uint8Array
+  ): { palette: Uint8Array; indices: Uint8Array } | null {
+    if (!this.dataConn?.open) return null;
+    if (!this.throttle()) return null;
+
+    this.frameCount++;
+    const N = w * h;
+    let forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(2) || this.prevSentColorIdx?.length !== N || this.prevSentIndices?.length !== N;
+    const chars = this.scratchChars(charIndices, N);
+    const q = this.quant.quantize(rgba, N, forceKeyframe, forceKeyframe ? null : this.prevSentColorIdx);
+    if (q.rebuilt) forceKeyframe = true; // new palette ⇒ everything must be re-sent against it
+
+    const buf = encodeFrame({
+      w, h, charset, colorIndices: q.indices, palette: q.palette, sendPalette: forceKeyframe,
+      charIndices: chars, blockColorMode: false,
+      prevCharIndices: forceKeyframe ? null : this.prevSentIndices,
+      prevColorIndices: forceKeyframe ? null : this.prevSentColorIdx,
+      forceKeyframe,
+    });
+    this.dispatch(buf, chars, q.indices, forceKeyframe);
+    return { palette: q.palette, indices: q.indices };
   }
 
   private shouldForceKeyframe(): boolean {
@@ -542,40 +570,29 @@ export class CallManager {
     return force;
   }
 
-  /** Color-block mode — sends only color data. rgba is w*h*4 RGBA bytes (alpha ignored). */
-  sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number) {
+  /** Color / Pixel (color-block) modes — send only color data; `pixelated` tells the peer to draw hard edges. rgba is w*h*4 RGBA bytes (alpha ignored). */
+  sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
 
     this.frameCount++;
     const N = w * h;
-    let forceKeyframe = this.shouldForceKeyframe() || !this.mapper.ready || this.prevSentColorIdx?.length !== N;
-    const out = new Uint8Array(N);
+    let forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(pixelated ? 4 : 3) || this.prevSentColorIdx?.length !== N;
+    const q = this.quant.quantize(rgba, N, forceKeyframe, forceKeyframe ? null : this.prevSentColorIdx);
+    if (q.rebuilt) forceKeyframe = true;
 
-    if (!forceKeyframe) {
-      this.mapper.map(rgba, N, this.prevSentColorIdx, 324, out);
-      // Palette has drifted (lighting change, new scene): rebuild it as a keyframe rather than smearing 256 stale colors.
-      if (this.mapper.lastRms > 26 && this.framesSinceKey >= 8) forceKeyframe = true;
-    }
-    if (forceKeyframe) {
-      this.mapper.setPalette(buildAdaptivePalette(rgba, N));
-      this.mapper.map(rgba, N, null, 0, out);
-    }
-
-    const prevColor = !forceKeyframe ? this.prevSentColorIdx : null;
     const buf = encodeFrame({
-      w, h, charset: "", colorIndices: out, palette: this.mapper.palette, sendPalette: forceKeyframe,
-      charIndices: null, blockColorMode: true,
-      prevCharIndices: null, prevColorIndices: prevColor,
+      w, h, charset: "", colorIndices: q.indices, palette: q.palette, sendPalette: forceKeyframe,
+      charIndices: null, blockColorMode: true, pixelated,
+      prevCharIndices: null, prevColorIndices: forceKeyframe ? null : this.prevSentColorIdx,
       forceKeyframe,
     });
-
-    this.dispatch(buf, null, out, forceKeyframe);
+    this.dispatch(buf, null, q.indices, forceKeyframe);
   }
 
   private throttle(): boolean {
     const now = performance.now();
-    const minInterval = 1000 / this.targetFps;
+    const minInterval = 1000 / this.targetFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
     if (this.lastSentAt > 0 && now - this.lastSentAt < minInterval) return false;
 
     const buffered = this.dataConn?.dataChannel?.bufferedAmount ?? 0;
@@ -583,6 +600,13 @@ export class CallManager {
 
     this.lastSentAt = now;
     return true;
+  }
+
+  /** Copies `src` into `slot` (reallocating only when the size changed) — the delta base must be a stable snapshot. */
+  private keep(slot: Uint8Array | null, src: Uint8Array): Uint8Array {
+    if (!slot || slot.length !== src.length) return new Uint8Array(src);
+    slot.set(src);
+    return slot;
   }
 
   private dispatch(buf: ArrayBuffer, charIndices: Uint8Array | null, colorIndices: Uint8Array | null, forceKeyframe: boolean) {
@@ -601,8 +625,8 @@ export class CallManager {
     try {
       this.dataConn.send(buf);
 
-      this.prevSentIndices   = charIndices ? new Uint8Array(charIndices) : null;
-      this.prevSentColorIdx  = colorIndices ? new Uint8Array(colorIndices) : null;
+      this.prevSentIndices   = charIndices ? this.keep(this.prevSentIndices, charIndices) : null;
+      this.prevSentColorIdx  = colorIndices ? this.keep(this.prevSentColorIdx, colorIndices) : null;
       this.consecutiveDrops = 0;
       if (forceKeyframe) { this.needKeyframe = false; this.framesSinceKey = 0; } else this.framesSinceKey++;
     } catch {
@@ -634,6 +658,7 @@ export class CallManager {
     this.prevSentIndices = null;
     this.prevSentColorIdx = null;
     this.prevRecvFrame = null;
+    this.lastKind = 0;
     this.frameCount = 0;
     try { this.dataConn?.close(); }  catch { /* noop */ }
     try { this.mediaConn?.close(); } catch { /* noop */ }

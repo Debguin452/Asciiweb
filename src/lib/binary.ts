@@ -7,6 +7,7 @@ export interface RemoteFrame {
   colorIndices: Bytes | null;
   isKeyframe: boolean;
   isBlockColor: boolean;
+  isPixelated: boolean; // block frames only: draw with hard pixel edges instead of smooth scaling
   timestamp: number;
 }
 
@@ -23,6 +24,7 @@ const FLAG_BLOCK_COLOR = 0x04;
 const FLAG_HAS_PALETTE = 0x08;
 const FLAG_ASCII_COLOR = 0x10;
 const FLAG_V2          = 0x20; // varint gap-coded deltas; palette only when flagged
+const FLAG_PIXELATED   = 0x40; // block frames: render with hard edges (Pixel mode)
 
 
 export function bitsNeeded(n: number): number {
@@ -217,6 +219,53 @@ export class PaletteMapper {
   }
 }
 
+/**
+ * Adaptive-palette quantizer shared by the pixel and colored-ASCII call modes (and the local preview).
+ * Rebuilds the palette on demand or when it has drifted; otherwise maps with temporal hysteresis so
+ * sensor noise doesn't flip palette indices (smaller deltas, no shimmer). `indices` is an internal
+ * buffer that is overwritten by the next call — copy it if you need to keep it.
+ */
+export class ColorQuantizer {
+  readonly mapper = new PaletteMapper();
+  private out: Bytes = new Uint8Array(0);
+  private last: Bytes | null = null;
+  private since = 0;
+
+  /** `prev` = the indices the receiver currently holds (defaults to this quantizer's own last output). */
+  quantize(rgba: ArrayLike<number>, n: number, forceRebuild: boolean, prev?: Bytes | null): { indices: Bytes; palette: Bytes; rebuilt: boolean } {
+    if (this.out.length !== n) { this.out = new Uint8Array(n); this.last = null; }
+    const base = prev !== undefined ? prev : this.last;
+    let rebuilt = forceRebuild || !this.mapper.ready || !base || base.length !== n;
+    if (!rebuilt) {
+      this.mapper.map(rgba, n, base, 324, this.out);
+      // Palette has drifted (lighting change, new scene): rebuild instead of smearing 256 stale colors.
+      if (this.mapper.lastRms > 26 && this.since >= 8) rebuilt = true;
+    }
+    if (rebuilt) {
+      this.mapper.setPalette(buildAdaptivePalette(rgba, n));
+      this.mapper.map(rgba, n, null, 0, this.out);
+      this.since = 0;
+    } else this.since++;
+    if (!this.last || this.last.length !== n) this.last = new Uint8Array(n);
+    this.last.set(this.out);
+    return { indices: this.out, palette: this.mapper.palette, rebuilt };
+  }
+}
+
+/**
+ * Fills `out` (RGBA, length ≥ n*4) from separate R/G/B planes while lifting brightness for colored ASCII:
+ * glyph density already encodes luminance, so a dim pixel drawn as a sparse dim glyph on a dark background
+ * is doubly dark. This keeps the hue but raises the strongest channel into 110..255.
+ */
+export function fillLiftedRgba(out: Uint8ClampedArray | Uint8Array, r: ArrayLike<number>, g: ArrayLike<number>, b: ArrayLike<number>, n: number): void {
+  for (let i = 0, o = 0; i < n; i++, o += 4) {
+    const cr = r[i], cg = g[i], cb = b[i];
+    const m = Math.max(cr, cg, cb, 24);
+    const k = (110 + 0.57 * m) / m;
+    out[o] = Math.min(255, cr * k); out[o + 1] = Math.min(255, cg * k); out[o + 2] = Math.min(255, cb * k); out[o + 3] = 255;
+  }
+}
+
 // ───────────────────────── varint gap-coded deltas (v2) ─────────────────────────
 
 function buildDeltaV2(curr: ArrayLike<number>, prev: ArrayLike<number>, n: number): Bytes {
@@ -268,6 +317,7 @@ export interface EncodeOpts {
   prevCharIndices: Bytes | null;
   prevColorIndices: Bytes | null;
   forceKeyframe: boolean;
+  pixelated?: boolean;
 }
 
 export function encodeFrame(opts: EncodeOpts): ArrayBuffer {
@@ -301,7 +351,7 @@ export function encodeFrame(opts: EncodeOpts): ArrayBuffer {
 
   const embedPalette = !!palette && !!(blockColorMode || colorIndices) && (opts.sendPalette || (isKeyframe && forceKeyframe));
   let flags = FLAG_V2 | (isKeyframe ? FLAG_KEYFRAME : FLAG_DELTA);
-  if (blockColorMode) flags |= FLAG_BLOCK_COLOR; else if (colorIndices) flags |= FLAG_ASCII_COLOR;
+  if (blockColorMode) { flags |= FLAG_BLOCK_COLOR; if (opts.pixelated) flags |= FLAG_PIXELATED; } else if (colorIndices) flags |= FLAG_ASCII_COLOR;
   if (embedPalette) flags |= FLAG_HAS_PALETTE;
 
   let charSection: Bytes = new Uint8Array(0);
@@ -339,6 +389,7 @@ export function decode(buffer: ArrayBuffer, prevFrame: RemoteFrame | null): Remo
   const hasPalette   = (flags & FLAG_HAS_PALETTE) !== 0;
   const hasAsciiColor = (flags & FLAG_ASCII_COLOR) !== 0;
   const isV2         = (flags & FLAG_V2) !== 0;
+  const isPixelated  = isBlockColor && (flags & FLAG_PIXELATED) !== 0;
 
   const w = (data[p++] << 8) | data[p++];
   const h = (data[p++] << 8) | data[p++];
@@ -395,7 +446,7 @@ export function decode(buffer: ArrayBuffer, prevFrame: RemoteFrame | null): Remo
     }
   }
 
-  return { w, h, charset, charIndices, palette, colorIndices, isKeyframe, isBlockColor, timestamp: performance.now() };
+  return { w, h, charset, charIndices, palette, colorIndices, isKeyframe, isBlockColor, isPixelated, timestamp: performance.now() };
 }
 
 export function toArrayBuffer(data: unknown): ArrayBuffer | null {
