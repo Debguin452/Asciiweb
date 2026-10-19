@@ -62,7 +62,8 @@ function leaveCanvasMode(pre: HTMLPreElement) {
 function fitFont(pre: HTMLPreElement, area: HTMLElement | null, w: number, h: number) {
   const key = `${w}x${h}@${layoutEpoch}`;
   if (pre.dataset.fk === key) return;
-  pre.dataset.fk = key;
+  const r = area?.getBoundingClientRect();
+  pre.dataset.fk = r && r.width && r.height ? key : ""; // box not laid out yet → measure again next frame instead of freezing a wrong size
   pre.style.fontSize = fontSizeForGrid(area, w, h) + "px";
   pre.style.lineHeight = "1.1";
 }
@@ -87,9 +88,9 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   cv.getContext("2d")!.putImageData(img, 0, 0);
   const key = `${w}x${h}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
-    cv.dataset.k = key;
     const r = area?.getBoundingClientRect();
     if (r && r.width && r.height) {
+      cv.dataset.k = key;
       const k = Math.min(r.width / (w * CHAR_W_RATIO), r.height / (h * CHAR_H_RATIO));
       cv.style.width  = Math.floor(w * CHAR_W_RATIO * k) + "px";
       cv.style.height = Math.floor(h * CHAR_H_RATIO * k) + "px";
@@ -157,8 +158,17 @@ function paintColorAscii(
   if (lastHtml.get(pre) !== html) { lastHtml.set(pre, html); pre.innerHTML = html; }
 }
 
+let zeroBuf = new Uint8Array(0);
+/** Pixel mode: every cell is a solid "█" in its palette color — the same look as the Camera tab's pixel view. */
+function paintPixelBlocks(pre: HTMLPreElement, area: HTMLElement | null, w: number, h: number, palette: ArrayLike<number>, colorIdx: ArrayLike<number>) {
+  if (zeroBuf.length < w * h) zeroBuf = new Uint8Array(w * h);
+  paintColorAscii(pre, area, w, h, "█", zeroBuf, palette, colorIdx);
+}
+
 function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement | null) {
   const { w, h, charset, charIndices, palette, colorIndices, isBlockColor } = frame;
+
+  if (isBlockColor && palette && colorIndices && frame.isPixelated) { paintPixelBlocks(pre, area, w, h, palette, colorIndices); return; }
 
   if (isBlockColor && palette && colorIndices) {
     const cv = overlayCanvas(pre);
@@ -168,7 +178,7 @@ function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement 
     const out = new Uint32Array(img.data.buffer);
     for (let i = 0, n = w * h; i < n; i++) out[i] = pal32[colorIndices[i]];
     lastHtml.delete(pre);
-    paintCanvas(pre, area, img, frame.isPixelated);
+    paintCanvas(pre, area, img);
     return;
   }
 
@@ -361,7 +371,7 @@ const IconAscii = (
 const CALL_MODES: { id: CallMode; label: string; hint: string; icon: ReactElement }[] = [
   { id: "ascii",       label: "ASCII",      hint: "Plain characters",          icon: IconAscii      },
   { id: "color",       label: "Color",      hint: "Smooth color video",        icon: IconColor      },
-  { id: "pixel",       label: "Pixel",      hint: "Chunky retro pixels",       icon: IconPixel      },
+  { id: "pixel",       label: "Pixel",      hint: "Solid block pixels",       icon: IconPixel      },
   { id: "color-ascii", label: "Color ASCII", hint: "Characters in true color", icon: IconColorAscii },
 ];
 
@@ -701,11 +711,10 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const callMode = callModeRef.current;
     const isMirror = facingRef.current === "user";
 
-    const isBlocks = callMode === "color" || callMode === "pixel";
-    const base  = isBlocks ? remoteFitColorRef.current : remoteFitRef.current;
-    const scale = qualityScaleRef.current * (callMode === "pixel" ? 0.4 : 1); // Pixel = coarse grid → big hard-edged pixels, and far fewer bytes
-    const cols  = Math.max(callMode === "pixel" ? 12 : 14, Math.round(base.cols * scale));
-    const rows  = Math.max(callMode === "pixel" ? 7 : 8,  Math.round(base.rows * scale));
+    const base  = callMode === "color" ? remoteFitColorRef.current : remoteFitRef.current; // Pixel uses the character grid, like ASCII
+    const scale = qualityScaleRef.current;
+    const cols  = Math.max(14, Math.round(base.cols * scale));
+    const rows  = Math.max(8,  Math.round(base.rows * scale));
     if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && now - lastResChangeRef.current > 1200) {
       lastResChangeRef.current = now;
       sendFitRef.current = { cols, rows };
@@ -713,13 +722,22 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const pip = sendFitRef.current;
 
     let produced = false;
-    if (isBlocks) {
+    if (callMode === "color") {
       const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
       if (img) {
-        paintCanvas(pre, localAreaRef.current, img, callMode === "pixel");
+        paintCanvas(pre, localAreaRef.current, img);
         localAreaRef.current?.classList.remove("call-area-dark");
-        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height, callMode === "pixel");
+        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height);
         produced = true;
+      }
+    } else if (callMode === "pixel") {
+      const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
+      if (img) {
+        const n = img.width * img.height;
+        let q: { palette: Uint8Array; indices: Uint8Array } | null = null;
+        if (mgr?.isConnected) q = mgr.sendColorFrame(img.data, img.width, img.height, true);
+        else { const lq = previewQuant.current.quantize(img.data, n, previewFrameN.current++ % 45 === 0); q = { palette: lq.palette, indices: lq.indices }; }
+        if (q) { paintPixelBlocks(pre, localAreaRef.current, img.width, img.height, q.palette, q.indices); produced = true; }
       }
     } else {
       const o = optsRef.current;
@@ -776,6 +794,13 @@ export default function CallTab({ opts, updateOpt }: Props) {
     if (screen !== "home") rafRef.current = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(rafRef.current);
   }, [screen, renderLoop]);
+
+  // Every screen renders its own <video>, so the stream attached before a screen change is left on an unmounted element —
+  // re-attach it to the new one (this is why the camera stayed blank after connecting until Flip re-ran startCam).
+  useEffect(() => {
+    const v = videoRef.current, st = streamRef.current;
+    if (v && st && v.srcObject !== st) { v.srcObject = st; v.play().catch(() => {}); }
+  }, [screen]);
 
   useEffect(() => () => { streamRef.current?.getTracks().forEach(t => t.stop()); }, []);
 
