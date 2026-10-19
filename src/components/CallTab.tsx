@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
-  renderToString, resetTemporalSmoothing, sortCharsetByDensity,
-  getPoolCharIdx, getPoolDims,
+  renderToString, renderToPool, resetTemporalSmoothing, sortCharsetByDensity,
+  getPoolCharIdx, getPoolColors, getPoolDims,
   type AsciiOptions,
 } from "../lib/ascii";
 import { CallManager, type CallStatus, type RemoteState } from "../lib/call";
-import { paletteToRgb, type RemoteFrame } from "../lib/binary";
+import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
 
 interface Props {
   opts: AsciiOptions;
@@ -15,6 +15,8 @@ interface Props {
 type Screen = "home" | "starting" | "in-call";
 type Facing = "user" | "environment";
 type Mode   = "host" | "guest" | null;
+/** ascii = plain glyphs · color = smooth color blocks (default) · pixel = coarse hard-edged pixels · color-ascii = glyphs tinted with the camera's colors */
+type CallMode = "ascii" | "color" | "pixel" | "color-ascii";
 
 const CHAR_W_RATIO = 0.575, CHAR_H_RATIO = 1.1;
 
@@ -28,6 +30,8 @@ function fontSizeForGrid(el: HTMLElement | null, cols: number, rows: number): nu
   return Math.max(2, Math.floor(Math.min(width / (cols * CHAR_W_RATIO), height / (rows * CHAR_H_RATIO))));
 }
 
+/** Last HTML written to a <pre> by the colored-ASCII painter, so identical frames skip the DOM parse. */
+const lastHtml = new WeakMap<HTMLPreElement, string>();
 const cvMap  = new WeakMap<HTMLPreElement, HTMLCanvasElement>();
 const imgMap = new WeakMap<HTMLCanvasElement, ImageData>();
 
@@ -45,6 +49,7 @@ function overlayCanvas(pre: HTMLPreElement): HTMLCanvasElement {
 function clearPre(pre: HTMLPreElement | null) {
   if (!pre) return;
   pre.textContent = "";
+  lastHtml.delete(pre);
   pre.dataset.m = "t"; pre.dataset.fk = "";
   const cv = cvMap.get(pre);
   if (cv) cv.style.display = "none";
@@ -64,14 +69,18 @@ function fitFont(pre: HTMLPreElement, area: HTMLElement | null, w: number, h: nu
 
 function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, w: number, h: number) {
   leaveCanvasMode(pre);
+  area?.classList.remove("call-area-dark");
+  lastHtml.delete(pre);
   fitFont(pre, area, w, h);
   pre.textContent = text;
 }
 
 /** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
-function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData) {
+function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData, pixelated = false) {
   const cv = overlayCanvas(pre);
-  if (pre.dataset.m !== "c") { pre.textContent = ""; pre.dataset.m = "c"; cv.style.display = "block"; }
+  const ir = pixelated ? "pixelated" : "auto";
+  if (cv.style.imageRendering !== ir) cv.style.imageRendering = ir;
+  if (pre.dataset.m !== "c") { pre.textContent = ""; lastHtml.delete(pre); pre.dataset.m = "c"; cv.style.display = "block"; }
   const w = img.width, h = img.height;
   if (cv.width !== w) cv.width = w;
   if (cv.height !== h) cv.height = h;
@@ -88,6 +97,66 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   }
 }
 
+// Per-frame work in the paint path is dominated by allocations and string building, so everything that only depends on
+// the charset or the palette is computed once and cached by identity (a palette object lives until the next keyframe).
+const glyphCache = new Map<string, string[]>();
+function glyphLut(charset: string, html: boolean): string[] {
+  const key = (html ? "h:" : "t:") + charset;
+  let l = glyphCache.get(key);
+  if (!l) {
+    l = Array.from(charset, c => c === " " ? "\u00a0" : html ? (c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c) : c);
+    if (glyphCache.size > 16) glyphCache.clear();
+    glyphCache.set(key, l);
+  }
+  return l;
+}
+
+const spanOpenCache = new WeakMap<object, string[]>();
+function spanOpens(pal: ArrayLike<number>): string[] {
+  let o = spanOpenCache.get(pal);
+  if (!o) {
+    o = new Array(256);
+    for (let i = 0; i < 256; i++) o[i] = `<span style="color:rgb(${pal[i * 3]},${pal[i * 3 + 1]},${pal[i * 3 + 2]})">`;
+    spanOpenCache.set(pal, o);
+  }
+  return o;
+}
+
+const pal32Cache = new WeakMap<object, Uint32Array>();
+function palette32(pal: ArrayLike<number>): Uint32Array {
+  let p = pal32Cache.get(pal);
+  if (!p) {
+    p = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) p[i] = 0xff000000 | (pal[i * 3 + 2] << 16) | (pal[i * 3 + 1] << 8) | pal[i * 3];
+    pal32Cache.set(pal, p);
+  }
+  return p;
+}
+
+/** Colored ASCII: one <span> per run of equal palette index; blanks never break a run (their color is invisible). */
+function paintColorAscii(
+  pre: HTMLPreElement, area: HTMLElement | null, w: number, h: number,
+  charset: string, chars: ArrayLike<number>, palette: ArrayLike<number>, colorIdx: ArrayLike<number>
+) {
+  const lut = glyphLut(charset, true), opens = spanOpens(palette);
+  let html = "", run = -1;
+  for (let y = 0, i = 0; y < h; y++) {
+    for (let x = 0; x < w; x++, i++) {
+      const g = lut[chars[i]] ?? "\u00a0";
+      if (g === "\u00a0") { html += g; continue; }
+      const c = colorIdx[i];
+      if (c !== run) { if (run >= 0) html += "</span>"; html += opens[c]; run = c; }
+      html += g;
+    }
+    if (y < h - 1) html += "\n";
+  }
+  if (run >= 0) html += "</span>";
+  leaveCanvasMode(pre);
+  area?.classList.add("call-area-dark");
+  fitFont(pre, area, w, h);
+  if (lastHtml.get(pre) !== html) { lastHtml.set(pre, html); pre.innerHTML = html; }
+}
+
 function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement | null) {
   const { w, h, charset, charIndices, palette, colorIndices, isBlockColor } = frame;
 
@@ -95,41 +164,17 @@ function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement 
     const cv = overlayCanvas(pre);
     let img = imgMap.get(cv);
     if (!img || img.width !== w || img.height !== h) { img = new ImageData(w, h); imgMap.set(cv, img); }
-    const pal32 = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) pal32[i] = 0xff000000 | (palette[i * 3 + 2] << 16) | (palette[i * 3 + 1] << 8) | palette[i * 3];
+    const pal32 = palette32(palette);
     const out = new Uint32Array(img.data.buffer);
     for (let i = 0, n = w * h; i < n; i++) out[i] = pal32[colorIndices[i]];
-    paintCanvas(pre, area, img);
+    lastHtml.delete(pre);
+    paintCanvas(pre, area, img, frame.isPixelated);
     return;
   }
 
-  const lut = Array.from(charset, c => (c === " " ? "\u00a0" : c));
+  if (palette && colorIndices) { paintColorAscii(pre, area, w, h, charset, charIndices, palette, colorIndices); return; }
 
-  if (palette && colorIndices) {
-    const colors = paletteToRgb(palette, colorIndices);
-    const lines: string[] = [];
-    for (let y = 0; y < h; y++) {
-      const parts: string[] = [];
-      let rr = -1, rg = -1, rb = -1, rt = "";
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        const cr = colors[i * 3], cg = colors[i * 3 + 1], cb = colors[i * 3 + 2];
-        const ch = lut[charIndices[i]] ?? "\u00a0";
-        if (cr === rr && cg === rg && cb === rb) rt += ch;
-        else {
-          if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
-          rr = cr; rg = cg; rb = cb; rt = ch;
-        }
-      }
-      if (rt) parts.push(`<span style="color:rgb(${rr},${rg},${rb})">${rt}</span>`);
-      lines.push(parts.join(""));
-    }
-    leaveCanvasMode(pre);
-    fitFont(pre, area, w, h);
-    pre.innerHTML = lines.join("\n");
-    return;
-  }
-
+  const lut = glyphLut(charset, false);
   const lines: string[] = new Array(h);
   for (let y = 0; y < h; y++) {
     let line = "";
@@ -169,6 +214,9 @@ const CALL_OPTS: Partial<AsciiOptions> = {
   gamma: 1.0, temporalSmoothing: true, charDensitySort: true, color: false,
   noiseReduction: false, localContrast: false, histEq: false,
 };
+
+// The wire format carries plain char indices, so glyph modes that don't map onto the charset can't be sent.
+const CALL_RENDER_FORCE: Partial<AsciiOptions> = { gradientDirs: false, brailleMode: false, blockMode: false };
 
 function sleep(ms: number) {
   return new Promise(r => setTimeout(r, ms));
@@ -290,6 +338,83 @@ const IconColor = (
   </svg>
 );
 
+const IconPixel = (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+    <rect x="3"  y="3"  width="5" height="5" opacity=".9"/><rect x="10" y="3"  width="5" height="5" opacity=".4"/><rect x="17" y="3"  width="4" height="5" opacity=".7"/>
+    <rect x="3"  y="10" width="5" height="5" opacity=".5"/><rect x="10" y="10" width="5" height="5" opacity=".9"/><rect x="17" y="10" width="4" height="5" opacity=".5"/>
+    <rect x="3"  y="17" width="5" height="4" opacity=".7"/><rect x="10" y="17" width="5" height="4" opacity=".5"/><rect x="17" y="17" width="4" height="4" opacity=".9"/>
+  </svg>
+);
+
+const IconColorAscii = (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 2.7s6 6.1 6 10.6a6 6 0 0 1-12 0c0-4.5 6-10.6 6-10.6z"/>
+  </svg>
+);
+
+const IconAscii = (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+    <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="700" fontFamily="monospace">@#</text>
+  </svg>
+);
+
+const CALL_MODES: { id: CallMode; label: string; hint: string; icon: ReactElement }[] = [
+  { id: "ascii",       label: "ASCII",      hint: "Plain characters",          icon: IconAscii      },
+  { id: "color",       label: "Color",      hint: "Smooth color video",        icon: IconColor      },
+  { id: "pixel",       label: "Pixel",      hint: "Chunky retro pixels",       icon: IconPixel      },
+  { id: "color-ascii", label: "Color ASCII", hint: "Characters in true color", icon: IconColorAscii },
+];
+
+/** Custom drop-down (opens upward from the call bar) for choosing the display mode. */
+function ModeSelect({ value, onChange }: { value: CallMode; onChange: (m: CallMode) => void }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => { if (!wrapRef.current?.contains(e.target as Node)) setOpen(false); };
+    const onKey  = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("pointerdown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  const cur = CALL_MODES.find(m => m.id === value) ?? CALL_MODES[1]; // default: color
+  return (
+    <div className="call-mode-wrap" ref={wrapRef}>
+      <button
+        className={`call-circle-btn${open ? " call-circle-active" : ""}`}
+        onClick={() => setOpen(o => !o)}
+        title="Display mode"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="call-circle-icon">{cur.icon}</span>
+        <span className="call-circle-label">{cur.label} ▴</span>
+      </button>
+      {open && (
+        <ul className="call-mode-menu" role="listbox" aria-label="Display mode">
+          {CALL_MODES.map(m => (
+            <li key={m.id} role="option" aria-selected={m.id === value}>
+              <button
+                className={`call-mode-opt${m.id === value ? " is-selected" : ""}`}
+                onClick={() => { onChange(m.id); setOpen(false); }}
+              >
+                <span className="call-mode-opt-icon">{m.icon}</span>
+                <span className="call-mode-opt-text">
+                  <span className="call-mode-opt-name">{m.label}</span>
+                  <span className="call-mode-opt-hint">{m.hint}</span>
+                </span>
+                {m.id === value && <span className="call-mode-check">✓</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 const IconFlip = (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
@@ -383,7 +508,10 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const modeRef       = useRef<Mode>(null);
   const mutedRef      = useRef(false);
   const camOffRef     = useRef(false);
-  const colorModeRef  = useRef(false);
+  const callModeRef   = useRef<CallMode>("color");
+  const rgbaBuf       = useRef(new Uint8ClampedArray(0));
+  const previewQuant  = useRef(new ColorQuantizer());
+  const previewFrameN = useRef(0);
   const facingRef     = useRef<Facing>("user");
   const fpsT          = useRef<number[]>([]);
   const pipDragRef    = useRef<{ startX: number; startY: number; origRight: number; origBottom: number } | null>(null);
@@ -398,7 +526,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const [muted,        setMuted]        = useState(false);
   const [camOff,       setCamOff]       = useState(false);
   const [facing,       setFacing]       = useState<Facing>("user");
-  const [colorMode,    setColorMode]    = useState(false);
+  const [callMode,     setCallMode]     = useState<CallMode>("color");
   const [remoteHere,   setRemoteHere]   = useState(false);
   const [peerHungUp,   setPeerHungUp]   = useState(false);
   const [remoteMuted,  setRemoteMuted]  = useState(false);
@@ -412,7 +540,11 @@ export default function CallTab({ opts, updateOpt }: Props) {
   const [pipPos,       setPipPos]       = useState({ right: 12, bottom: 68 });
 
   useEffect(() => { optsRef.current    = opts;       }, [opts]);
-  useEffect(() => { colorModeRef.current = colorMode; }, [colorMode]);
+  useEffect(() => {
+    callModeRef.current = callMode;
+    lastResChangeRef.current = 0; // let the capture grid adopt the new mode's budget immediately
+    resetTemporalSmoothing();
+  }, [callMode]);
   useEffect(() => { facingRef.current  = facing;     }, [facing]);
   useEffect(() => { mutedRef.current   = muted;      }, [muted]);
   useEffect(() => { camOffRef.current  = camOff;     }, [camOff]);
@@ -566,13 +698,14 @@ export default function CallTab({ opts, updateOpt }: Props) {
     else if (now - lastPreviewRef.current < 66) return;
     lastPreviewRef.current = now;
 
-    const isColor  = colorModeRef.current;
+    const callMode = callModeRef.current;
     const isMirror = facingRef.current === "user";
 
-    const base  = isColor ? remoteFitColorRef.current : remoteFitRef.current;
-    const scale = qualityScaleRef.current;
-    const cols  = Math.max(14, Math.round(base.cols * scale));
-    const rows  = Math.max(8,  Math.round(base.rows * scale));
+    const isBlocks = callMode === "color" || callMode === "pixel";
+    const base  = isBlocks ? remoteFitColorRef.current : remoteFitRef.current;
+    const scale = qualityScaleRef.current * (callMode === "pixel" ? 0.4 : 1); // Pixel = coarse grid → big hard-edged pixels, and far fewer bytes
+    const cols  = Math.max(callMode === "pixel" ? 12 : 14, Math.round(base.cols * scale));
+    const rows  = Math.max(callMode === "pixel" ? 7 : 8,  Math.round(base.rows * scale));
     if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && now - lastResChangeRef.current > 1200) {
       lastResChangeRef.current = now;
       sendFitRef.current = { cols, rows };
@@ -580,28 +713,51 @@ export default function CallTab({ opts, updateOpt }: Props) {
     const pip = sendFitRef.current;
 
     let produced = false;
-    if (isColor) {
+    if (isBlocks) {
       const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
       if (img) {
-        paintCanvas(pre, localAreaRef.current, img);
-        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height);
+        paintCanvas(pre, localAreaRef.current, img, callMode === "pixel");
+        localAreaRef.current?.classList.remove("call-area-dark");
+        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height, callMode === "pixel");
         produced = true;
       }
     } else {
       const o = optsRef.current;
       const cs = callCharset(o.charset);
-      const result = renderToString(video, offscreen.current, {
-        ...o, ...CALL_OPTS, charset: cs, asciiW: pip.cols, asciiH: pip.rows, color: false,
-      }, isMirror, "text");
-      if (result) {
+      const withColor = callMode === "color-ascii";
+      const ropts = { ...o, ...CALL_OPTS, ...CALL_RENDER_FORCE, charset: cs, asciiW: pip.cols, asciiH: pip.rows, color: withColor };
+
+      if (withColor) {
+        const res = renderToPool(video, offscreen.current, ropts, isMirror);
         const { w, h } = getPoolDims();
-        if (w > 0 && h > 0) {
-          paintText(pre, localAreaRef.current, result.html, w, h);
-          if (mgr?.isConnected) {
-            const raw = getPoolCharIdx();
-            mgr.sendAsciiFrame(raw.length === w * h ? raw : raw.subarray(0, w * h), w, h, sortCharsetByDensity(cs), null);
+        if (res && w > 0 && h > 0) {
+          const N = w * h;
+          if (rgbaBuf.current.length < N * 4) rgbaBuf.current = new Uint8ClampedArray(N * 4);
+          const { r, g, b } = getPoolColors();
+          fillLiftedRgba(rgbaBuf.current, r, g, b, N);
+          const sorted = res.chars;
+          const raw = getPoolCharIdx();
+          let q: { palette: Uint8Array; indices: Uint8Array } | null = null;
+          if (mgr?.isConnected) q = mgr.sendAsciiColorFrame(raw, w, h, sorted, rgbaBuf.current);
+          else {
+            // Not connected yet: quantize locally so the preview looks exactly like what the peer will get.
+            const lq = previewQuant.current.quantize(rgbaBuf.current, N, previewFrameN.current++ % 45 === 0);
+            q = { palette: lq.palette, indices: lq.indices };
           }
-          produced = true;
+          if (q) { paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices); produced = true; }
+        }
+      } else {
+        const result = renderToString(video, offscreen.current, ropts, isMirror, "text");
+        if (result) {
+          const { w, h } = getPoolDims();
+          if (w > 0 && h > 0) {
+            paintText(pre, localAreaRef.current, result.html, w, h);
+            if (mgr?.isConnected) {
+              const raw = getPoolCharIdx();
+              mgr.sendAsciiFrame(raw.length === w * h ? raw : raw.subarray(0, w * h), w, h, sortCharsetByDensity(cs));
+            }
+            produced = true;
+          }
         }
       }
     }
@@ -1012,14 +1168,7 @@ export default function CallTab({ opts, updateOpt }: Props) {
           <span className="call-circle-label">{camOff ? "Off" : "Camera"}</span>
         </button>
 
-        <button
-          className={`call-circle-btn${colorMode ? " call-circle-active" : ""}`}
-          onClick={() => setColorMode(m => !m)}
-          title="Color blocks"
-        >
-          <span className="call-circle-icon">{IconColor}</span>
-          <span className="call-circle-label">Color</span>
-        </button>
+        <ModeSelect value={callMode} onChange={setCallMode} />
 
         <button className="call-circle-btn" onClick={flipCam} title="Flip camera">
           <span className="call-circle-icon">{IconFlip}</span>
