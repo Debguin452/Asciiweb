@@ -8,6 +8,8 @@ export interface RemoteFrame {
   isKeyframe: boolean;
   isBlockColor: boolean;
   isPixelated: boolean; // block frames only: draw with hard pixel edges instead of smooth scaling
+  /** Adaptive-detail Color frames carry a ready-to-draw square-pixel image instead of glyph/palette data. */
+  image?: ImageData;
   timestamp: number;
 }
 

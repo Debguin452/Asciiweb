@@ -2,6 +2,7 @@ import Peer, { type DataConnection, type MediaConnection } from "peerjs";
 import {
   encodeFrame, decode, toArrayBuffer, ColorQuantizer, type RemoteFrame,
 } from "./binary";
+import { AdaptiveEncoder, AdaptiveDecoder, ADAPTIVE_FLAG } from "./adaptive";
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
 // that was the Cloudflare-billed path, skipped in favor of this) or its
@@ -148,8 +149,10 @@ export class CallManager {
   private prevSentColorIdx: Uint8Array | null = null;
   private prevRecvFrame: RemoteFrame | null = null;
   private quant = new ColorQuantizer();
+  private adaptEnc = new AdaptiveEncoder();
+  private adaptDec = new AdaptiveDecoder();
   private curChars = new Uint8Array(0); // reused per-frame scratch (no per-frame allocations on the hot path)
-  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = pixel; a change forces a keyframe (+palette)
+  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = pixel, 5 = adaptive color; a change forces a keyframe (+palette)
   private framesSinceKey = 0;
   private needKeyframe = true;
   private lastKfRequestAt = 0;
@@ -395,6 +398,7 @@ export class CallManager {
       this.events.onStatus("connected");
       this.receivedKeyframe = false;
       this.prevRecvFrame    = null;
+      this.adaptDec.reset();
       this.lastRecvAt       = performance.now();
       this.startHeartbeat();
     });
@@ -415,7 +419,17 @@ export class CallManager {
       }
 
       const buf = toArrayBuffer(data);
-      if (buf) {
+      if (buf && buf.byteLength > 0 && (new Uint8Array(buf, 0, 1)[0] & ADAPTIVE_FLAG)) {
+        // Adaptive-detail Color frame
+        const image = this.adaptDec.decode(new Uint8Array(buf));
+        if (image) {
+          this.prevRecvFrame = null; // legacy delta bases don't carry over; the sender keyframes on every mode change
+          this.events.onRemoteFrame({
+            w: image.width, h: image.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
+            isKeyframe: false, isBlockColor: false, isPixelated: false, image, timestamp: performance.now(),
+          });
+        } else this.requestKeyframe();
+      } else if (buf) {
         const frame = decode(buf, this.prevRecvFrame);
         if (frame) {
           if (frame.isKeyframe) this.receivedKeyframe = true;
@@ -591,6 +605,21 @@ export class CallManager {
     return { palette: q.palette, indices: q.indices };
   }
 
+  /**
+   * Color mode — adaptive-detail video. `rgba` is a square-pixel w×h image (both multiples of 8). Detail is spent where the
+   * picture has it; the packet is sized to this quality tier's frame budget, so the network scaler works through the budget
+   * rather than by shrinking the whole frame.
+   */
+  sendAdaptiveFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number) {
+    if (!this.dataConn?.open) return;
+    if (!this.throttle()) return;
+
+    this.frameCount++;
+    const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(5);
+    const buf = this.adaptEnc.encode(rgba, w, h, Math.round(this.maxFrameSize * 0.8), forceKeyframe);
+    this.dispatch(buf, null, null, forceKeyframe);
+  }
+
   private throttle(): boolean {
     const now = performance.now();
     const minInterval = 1000 / this.targetFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
@@ -659,6 +688,7 @@ export class CallManager {
     this.prevSentIndices = null;
     this.prevSentColorIdx = null;
     this.prevRecvFrame = null;
+    this.adaptEnc.reset(); this.adaptDec.reset();
     this.lastKind = 0;
     this.frameCount = 0;
     try { this.dataConn?.close(); }  catch { /* noop */ }
