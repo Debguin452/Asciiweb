@@ -89,7 +89,7 @@ function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, 
 
 /** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
 /** `square`: cells are square pixels (adaptive Color mode) rather than character-shaped cells. */
-function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData, square = false, pixelated = false) {
+function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData | HTMLCanvasElement, square = false, pixelated = false) {
   const cv = overlayCanvas(pre);
   if (pre.dataset.m !== "c" || pre.firstChild) { pre.textContent = ""; lastHtml.delete(pre); pre.dataset.m = "c"; }
   if (cv.style.display !== "block") cv.style.display = "block";
@@ -98,7 +98,8 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   const w = img.width, h = img.height;
   if (cv.width !== w) cv.width = w;
   if (cv.height !== h) cv.height = h;
-  cv.getContext("2d")!.putImageData(img, 0, 0);
+  const cctx = cv.getContext("2d")!;
+  if (img instanceof HTMLCanvasElement) cctx.drawImage(img, 0, 0); else cctx.putImageData(img, 0, 0);
   const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
@@ -182,6 +183,7 @@ function paintPixelBlocks(pre: HTMLPreElement, area: HTMLElement | null, w: numb
 function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement | null) {
   const { w, h, charset, charIndices, palette, colorIndices, isBlockColor } = frame;
 
+  if (frame.canvas) { lastHtml.delete(pre); paintCanvas(pre, area, frame.canvas, true); return; } // real-video Color frame
   if (frame.image) { lastHtml.delete(pre); paintCanvas(pre, area, frame.image, true, frame.isPixelated); return; }
 
   if (isBlockColor && palette && colorIndices && frame.isPixelated) { paintPixelBlocks(pre, area, w, h, palette, colorIndices); return; }
@@ -755,12 +757,20 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
     let produced = false;
     if (callMode === "color") {
-      const d = adaptiveDims(video.videoWidth, video.videoHeight);
+      // Real video (WebCodecs) when both peers support it: far better quality per byte, and it uses a bigger capture size.
+      // Otherwise the adaptive quadtree codec on a 192-px grid.
+      const plan = mgr?.isConnected ? mgr.videoPlan(video.videoWidth, video.videoHeight) : null;
+      const d = plan ?? adaptiveDims(video.videoWidth, video.videoHeight);
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
         lowLight.current.process(img.data, img.width, img.height);
         if (show) { paintCanvas(pre, localAreaRef.current, img, true); localAreaRef.current?.classList.remove("call-area-dark"); }
-        if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height);
+        if (mgr?.isConnected) {
+          if (!(plan && mgr.sendVideoFrame(img.data, img.width, img.height))) {
+            if (plan) { /* video just became unusable — this frame is at the video size, so let the next one use the quadtree grid */ }
+            else mgr.sendAdaptiveFrame(img.data, img.width, img.height);
+          }
+        }
         produced = true;
       }
     } else if (callMode === "pixel") {
