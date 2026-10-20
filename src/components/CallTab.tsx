@@ -1,3 +1,4 @@
+import { LowLightAssist } from "../lib/denoise";
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import {
   renderToString, renderToPool, resetTemporalSmoothing, sortCharsetByDensity,
@@ -516,6 +517,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const audioRef      = useRef<HTMLAudioElement>(null);
   const offscreen     = useRef(document.createElement("canvas"));
   const colorCanvas   = useRef(document.createElement("canvas"));
+  const lowLight      = useRef(new LowLightAssist()); // dim-room denoise for Color/Pixel; does nothing in good light
   const localPreRef   = useRef<HTMLPreElement>(null);
   const remotePreRef  = useRef<HTMLPreElement>(null);
   const localAreaRef  = useRef<HTMLDivElement>(null);
@@ -756,6 +758,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       const d = adaptiveDims(video.videoWidth, video.videoHeight);
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
+        lowLight.current.process(img.data, img.width, img.height);
         if (show) { paintCanvas(pre, localAreaRef.current, img, true); localAreaRef.current?.classList.remove("call-area-dark"); }
         if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height);
         produced = true;
@@ -766,6 +769,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       const d = adaptiveDims(video.videoWidth, video.videoHeight, long);
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
+        lowLight.current.process(img.data, img.width, img.height);
         if (show) { paintCanvas(pre, localAreaRef.current, img, true, true); localAreaRef.current?.classList.remove("call-area-dark"); }
         if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height, true);
         produced = true;
@@ -864,6 +868,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   // the same thing automatically instead of making the person notice and
   // back out manually.
   const startCam = async (face: Facing = facing): Promise<boolean> => {
+    lowLight.current.reset(); // new camera/stream: forget the old noise reading and running average
     setCamErr(null);
     if (videoRef.current) videoRef.current.srcObject = null;
     // Keep the live mic track across camera flips: the call's audio sender is bound to that exact track,
