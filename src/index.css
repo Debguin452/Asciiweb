@@ -916,7 +916,11 @@ html, body, #root {
 
 .call-pre-wa {
   position: absolute;
-  inset: 0;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%); /* same centre as the overlay canvas, so the two layers can never sit offset */
+  width: max-content;
+  height: max-content;
   margin: 0;
   padding: 0;
   font-family: "Fira Code", "Cascadia Code", "Consolas", monospace;
