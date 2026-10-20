@@ -75,6 +75,8 @@ export default function App() {
   const [exportFg,  setExportFg]  = useState("#39ff14");
   const [libKey,    setLibKey]    = useState(0);
   const [editItem,  setEditItem]  = useState<LibraryItem | null>(null);
+  const [callMounted, setCallMounted] = useState(initial.tab === "call"); // mounted on first visit, then kept alive so switching tabs never ends a call
+  const [callLive,    setCallLive]    = useState(false);
   const themeRef    = useRef<HTMLDivElement>(null);
   const prevIsLight = useRef(false);
 
@@ -95,7 +97,21 @@ export default function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  useEffect(() => { document.title = `asciiweb — ${tab}`; }, [tab]);
+  useEffect(() => { if (tab === "call") setCallMounted(true); }, [tab]);
+  useEffect(() => { document.title = `asciiweb — ${tab}${callLive ? " · in call" : ""}`; }, [tab, callLive]);
+
+  // Light haptic tick on touch devices for any button press (no-op on desktop / reduced-motion).
+  useEffect(() => {
+    if (!("vibrate" in navigator) || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const coarse = window.matchMedia("(pointer: coarse)");
+    const onDown = (e: PointerEvent) => {
+      if (!coarse.matches) return;
+      const b = (e.target as Element | null)?.closest?.("button");
+      if (b && !(b as HTMLButtonElement).disabled) navigator.vibrate(6);
+    };
+    document.addEventListener("pointerdown", onDown, { passive: true });
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, []);
 
   const updateOpt = <K extends keyof AsciiOptions>(key: K, val: AsciiOptions[K]) =>
     setOpts(o => ({ ...o, [key]: val }));
@@ -137,8 +153,9 @@ export default function App() {
               className={`tab-btn${tab === t.id ? " tab-active" : ""}`}
               onClick={() => setTab(t.id)}
               title={t.label}
+              aria-current={tab === t.id ? "page" : undefined}
             >
-              <span className="tab-icon">{TAB_ICONS[t.id]}</span>
+              <span className="tab-icon">{TAB_ICONS[t.id]}{t.id === "call" && callLive && <span className="tab-live-dot" aria-label="Call in progress" />}</span>
               <span className="tab-label">{t.label}</span>
             </button>
           ))}
@@ -166,11 +183,23 @@ export default function App() {
       </header>
 
       <main className="app-main">
-        {tab === "camera"  && <CameraTab  opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} exportFg={exportFg} onExportFgChange={setExportFg} />}
-        {tab === "image"   && <ImageTab   opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} editItem={editItem} onEditDone={() => setEditItem(null)} exportFg={exportFg} onExportFgChange={setExportFg} />}
-        {tab === "library" && <LibraryTab fontSize={fontSize} refreshKey={libKey} onEdit={item => { setEditItem(item); setTab("image"); }} />}
-        {tab === "call"    && <CallTab    opts={opts} updateOpt={updateOpt} inviteCode={inviteCode} onInviteConsumed={() => navigate("call", "", true)} />}
-        {tab === "about"   && <AboutTab />}
+        {tab === "camera"  && <div className="tab-pane" key="camera"><CameraTab  opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} exportFg={exportFg} onExportFgChange={setExportFg} /></div>}
+        {tab === "image"   && <div className="tab-pane" key="image"><ImageTab   opts={opts} updateOpt={updateOpt} fontSize={fontSize} setFontSize={setFontSize} onReset={resetOpts} onLibraryUpdated={() => setLibKey(k => k + 1)} editItem={editItem} onEditDone={() => setEditItem(null)} exportFg={exportFg} onExportFgChange={setExportFg} /></div>}
+        {tab === "library" && <div className="tab-pane" key="library"><LibraryTab fontSize={fontSize} refreshKey={libKey} onEdit={item => { setEditItem(item); setTab("image"); }} /></div>}
+        {callMounted && (
+          <div className="tab-pane" key="call" hidden={tab !== "call"}>
+            <CallTab opts={opts} updateOpt={updateOpt} inviteCode={inviteCode} onInviteConsumed={() => navigate("call", "", true)} active={tab === "call"} onLiveChange={setCallLive} />
+          </div>
+        )}
+        {tab === "about"   && <div className="tab-pane" key="about"><AboutTab /></div>}
+
+        {callLive && tab !== "call" && (
+          <button className="call-live-pill" onClick={() => setTab("call")} title="Return to your call">
+            <span className="call-live-pulse" />
+            <span>Call in progress</span>
+            <span className="call-live-return">Return ›</span>
+          </button>
+        )}
       </main>
     </div>
   );
