@@ -152,7 +152,7 @@ export class CallManager {
   private adaptEnc = new AdaptiveEncoder();
   private adaptDec = new AdaptiveDecoder();
   private curChars = new Uint8Array(0); // reused per-frame scratch (no per-frame allocations on the hot path)
-  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = pixel, 5 = adaptive color; a change forces a keyframe (+palette)
+  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = legacy pixel, 5 = adaptive color, 6 = adaptive pixel art; a change forces a keyframe (+palette)
   private framesSinceKey = 0;
   private needKeyframe = true;
   private lastKfRequestAt = 0;
@@ -426,7 +426,7 @@ export class CallManager {
           this.prevRecvFrame = null; // legacy delta bases don't carry over; the sender keyframes on every mode change
           this.events.onRemoteFrame({
             w: image.width, h: image.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
-            isKeyframe: false, isBlockColor: false, isPixelated: false, image, timestamp: performance.now(),
+            isKeyframe: false, isBlockColor: false, isPixelated: this.adaptDec.lastPixelated, image, timestamp: performance.now(),
           });
         } else this.requestKeyframe();
       } else if (buf) {
@@ -610,13 +610,13 @@ export class CallManager {
    * picture has it; the packet is sized to this quality tier's frame budget, so the network scaler works through the budget
    * rather than by shrinking the whole frame.
    */
-  sendAdaptiveFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number) {
+  sendAdaptiveFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixel = false) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
 
     this.frameCount++;
-    const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(5);
-    const buf = this.adaptEnc.encode(rgba, w, h, Math.round(this.maxFrameSize * 0.8), forceKeyframe);
+    const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(pixel ? 6 : 5);
+    const buf = this.adaptEnc.encode(rgba, w, h, Math.round(this.maxFrameSize * 0.8), forceKeyframe, { pixel });
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
