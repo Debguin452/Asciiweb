@@ -87,24 +87,24 @@ function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, 
 }
 
 /** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
-function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData, pixelated = false) {
+/** `square`: cells are square pixels (adaptive Color mode) rather than character-shaped cells. */
+function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData, square = false) {
   const cv = overlayCanvas(pre);
-  const ir = pixelated ? "pixelated" : "auto";
-  if (cv.style.imageRendering !== ir) cv.style.imageRendering = ir;
   if (pre.dataset.m !== "c" || pre.firstChild) { pre.textContent = ""; lastHtml.delete(pre); pre.dataset.m = "c"; }
   if (cv.style.display !== "block") cv.style.display = "block";
   const w = img.width, h = img.height;
   if (cv.width !== w) cv.width = w;
   if (cv.height !== h) cv.height = h;
   cv.getContext("2d")!.putImageData(img, 0, 0);
-  const key = `${w}x${h}@${layoutEpoch}`;
+  const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
     if (r && r.width && r.height) {
       cv.dataset.k = key;
-      const k = Math.min(r.width / (w * CHAR_W_RATIO), r.height / (h * CHAR_H_RATIO));
-      cv.style.width  = Math.floor(w * CHAR_W_RATIO * k) + "px";
-      cv.style.height = Math.floor(h * CHAR_H_RATIO * k) + "px";
+      const cw = square ? 1 : CHAR_W_RATIO, ch = square ? 1 : CHAR_H_RATIO;
+      const k = Math.min(r.width / (w * cw), r.height / (h * ch));
+      cv.style.width  = Math.floor(w * cw * k) + "px";
+      cv.style.height = Math.floor(h * ch * k) + "px";
     }
   }
 }
@@ -179,6 +179,8 @@ function paintPixelBlocks(pre: HTMLPreElement, area: HTMLElement | null, w: numb
 function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement | null) {
   const { w, h, charset, charIndices, palette, colorIndices, isBlockColor } = frame;
 
+  if (frame.image) { lastHtml.delete(pre); paintCanvas(pre, area, frame.image, true); return; }
+
   if (isBlockColor && palette && colorIndices && frame.isPixelated) { paintPixelBlocks(pre, area, w, h, palette, colorIndices); return; }
 
   if (isBlockColor && palette && colorIndices) {
@@ -204,6 +206,13 @@ function paintRemote(frame: RemoteFrame, pre: HTMLPreElement, area: HTMLElement 
     lines[y] = line;
   }
   paintText(pre, area, lines.join("\n"), w, h);
+}
+
+/** Square-pixel capture grid for adaptive Color mode: long side 192, both sides multiples of 8 (the codec's root block). */
+function adaptiveDims(vw: number, vh: number): { w: number; h: number } {
+  const LONG = 192, landscape = vw >= vh;
+  const short = Math.max(8, Math.round(LONG * (landscape ? vh / vw : vw / vh) / 8) * 8);
+  return landscape ? { w: LONG, h: short } : { w: short, h: LONG };
 }
 
 function sampleColorFrame(
@@ -381,7 +390,7 @@ const IconAscii = (
 
 const CALL_MODES: { id: CallMode; label: string; hint: string; icon: ReactElement }[] = [
   { id: "ascii",       label: "ASCII",      hint: "Plain characters",          icon: IconAscii      },
-  { id: "color",       label: "Color",      hint: "Smooth color video",        icon: IconColor      },
+  { id: "color",       label: "Color",      hint: "Detail where it matters",        icon: IconColor      },
   { id: "pixel",       label: "Pixel",      hint: "Solid block pixels",       icon: IconPixel      },
   { id: "color-ascii", label: "Color ASCII", hint: "Characters in true color", icon: IconColorAscii },
 ];
@@ -742,10 +751,11 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
     let produced = false;
     if (callMode === "color") {
-      const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
+      const d = adaptiveDims(video.videoWidth, video.videoHeight);
+      const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
-        if (show) { paintCanvas(pre, localAreaRef.current, img); localAreaRef.current?.classList.remove("call-area-dark"); }
-        if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height);
+        if (show) { paintCanvas(pre, localAreaRef.current, img, true); localAreaRef.current?.classList.remove("call-area-dark"); }
+        if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height);
         produced = true;
       }
     } else if (callMode === "pixel") {
