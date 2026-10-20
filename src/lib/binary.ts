@@ -10,6 +10,8 @@ export interface RemoteFrame {
   isPixelated: boolean; // block frames only: draw with hard pixel edges instead of smooth scaling
   /** Adaptive-detail Color frames carry a ready-to-draw square-pixel image instead of glyph/palette data. */
   image?: ImageData;
+  /** Video-codec Color frames: the decoder's output canvas (already the latest picture). */
+  canvas?: HTMLCanvasElement;
   timestamp: number;
 }
 

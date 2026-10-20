@@ -3,6 +3,10 @@ import {
   encodeFrame, decode, toArrayBuffer, ColorQuantizer, type RemoteFrame,
 } from "./binary";
 import { AdaptiveEncoder, AdaptiveDecoder, ADAPTIVE_FLAG } from "./adaptive";
+import {
+  VideoSender, VideoReceiver, VIDEO_PACKET_MASK, VIDEO_CODEC_PREFERENCE, VIDEO_TIERS,
+  probeEncoders, probeDecoders, videoDims, webCodecsAvailable, type VideoCodecId,
+} from "./videocodec";
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
 // that was the Cloudflare-billed path, skipped in favor of this) or its
@@ -151,8 +155,15 @@ export class CallManager {
   private quant = new ColorQuantizer();
   private adaptEnc = new AdaptiveEncoder();
   private adaptDec = new AdaptiveDecoder();
+  // ── WebCodecs video (Color mode). Used only when BOTH peers can handle a common codec; otherwise the quadtree codec runs.
+  private videoTx = new VideoSender();
+  private videoRx = new VideoReceiver();
+  private encCodecs: VideoCodecId[] = [];            // what this browser can encode (probed once)
+  private encProbe: Promise<void> | null = null;
+  private remoteDec: VideoCodecId[] | null = null;   // what the peer told us it can decode (null = not yet)
+  private videoDisabled = false;                     // an error or the peer's "nowc" switched us back to the quadtree codec
   private curChars = new Uint8Array(0); // reused per-frame scratch (no per-frame allocations on the hot path)
-  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = legacy pixel, 5 = adaptive color, 6 = adaptive pixel art; a change forces a keyframe (+palette)
+  private lastKind = 0;                  // 1 = ascii, 2 = colored ascii, 3 = color blocks, 4 = legacy pixel, 5 = adaptive color, 6 = adaptive pixel art, 7 = real video; a change forces a keyframe (+palette)
   private framesSinceKey = 0;
   private needKeyframe = true;
   private lastKfRequestAt = 0;
@@ -203,6 +214,19 @@ export class CallManager {
 
   constructor(events: CallManagerEvents) {
     this.events = events;
+    this.videoTx.onPacket = (buf, key) => this.dispatchVideo(buf, key);
+    this.videoTx.onFailure = () => { this.videoDisabled = true; this.needKeyframe = true; };
+    this.videoRx.onFrame = () => {
+      const c = this.videoRx.canvas;
+      this.prevRecvFrame = null;
+      this.events.onRemoteFrame({
+        w: c.width, h: c.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
+        isKeyframe: false, isBlockColor: false, isPixelated: false, canvas: c, timestamp: performance.now(),
+      });
+    };
+    this.videoRx.onNeedKey = () => this.requestKeyframe();
+    this.videoRx.onUnsupported = () => { try { this.dataConn?.send({ type: "nowc" }); } catch { /* noop */ } };
+    if (webCodecsAvailable()) this.encProbe = probeEncoders().then(c => { this.encCodecs = c; }).catch(() => {});
   }
 
   async start(): Promise<string> {
@@ -399,6 +423,9 @@ export class CallManager {
       this.receivedKeyframe = false;
       this.prevRecvFrame    = null;
       this.adaptDec.reset();
+      this.videoRx.reset(); this.videoTx.reset();
+      this.remoteDec = null; this.videoDisabled = false;
+      probeDecoders().then(dec => { try { conn.send({ type: "caps", dec }); } catch { /* noop */ } }).catch(() => {});
       this.lastRecvAt       = performance.now();
       this.startHeartbeat();
     });
@@ -407,10 +434,12 @@ export class CallManager {
       this.lastRecvAt = performance.now();
 
       if (data && typeof data === "object" && "type" in (data as Record<string, unknown>) && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
-        const m = data as { type: string; t?: number; micMuted?: boolean; camOff?: boolean };
+        const m = data as { type: string; t?: number; micMuted?: boolean; camOff?: boolean; dec?: number[] };
         if (m.type === "ping") { try { conn.send({ type: "pong", t: m.t }); } catch { /* noop */ } return; }
         if (m.type === "pong") { if (typeof m.t === "number") this.onRtt(performance.now() - m.t); return; }
         if (m.type === "kf") { this.needKeyframe = true; return; }
+        if (m.type === "caps") { this.remoteDec = Array.isArray(m.dec) ? (m.dec.filter(n => n === 0 || n === 1 || n === 2) as VideoCodecId[]) : []; return; }
+        if (m.type === "nowc") { this.videoDisabled = true; this.needKeyframe = true; return; } // the peer can't show video packets after all
         if (m.type === "state") {
           this.events.onRemoteState?.({ micMuted: !!m.micMuted, camOff: !!m.camOff });
           return;
@@ -419,7 +448,10 @@ export class CallManager {
       }
 
       const buf = toArrayBuffer(data);
-      if (buf && buf.byteLength > 0 && (new Uint8Array(buf, 0, 1)[0] & ADAPTIVE_FLAG)) {
+      const b0 = buf && buf.byteLength > 0 ? new Uint8Array(buf, 0, 1)[0] : 0;
+      if (buf && (b0 & VIDEO_PACKET_MASK) === VIDEO_PACKET_MASK) {
+        this.videoRx.push(new Uint8Array(buf)); // real-video Color frame (decoded asynchronously, delivered via videoRx.onFrame)
+      } else if (buf && (b0 & ADAPTIVE_FLAG)) {
         // Adaptive-detail Color frame
         const image = this.adaptDec.decode(new Uint8Array(buf));
         if (image) {
@@ -620,6 +652,54 @@ export class CallManager {
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
+  /** The codec both peers can use for real-video Color mode, or null (→ use the quadtree codec). */
+  private get videoCodec(): VideoCodecId | null {
+    if (this.videoDisabled || !this.remoteDec || !this.videoTx.usable) return null;
+    for (const id of VIDEO_CODEC_PREFERENCE) if (this.encCodecs.includes(id) && this.remoteDec.includes(id)) return id;
+    return null;
+  }
+
+  /** Capture size for real-video Color mode at the current quality tier, or null when it isn't available. */
+  videoPlan(vw: number, vh: number): { w: number; h: number } | null {
+    if (this.videoCodec === null || !this.dataConn?.open) return null;
+    return videoDims(vw, vh, VIDEO_TIERS[this.qualityLevel].long);
+  }
+
+  /**
+   * Real-video Color mode (WebCodecs). `rgba` is a w×h frame at the size from videoPlan(). Returns false only when video isn't
+   * usable (caller should use the quadtree codec); a frame skipped for pacing/backlog still counts as handled.
+   */
+  sendVideoFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number): boolean {
+    const codec = this.videoCodec;
+    if (codec === null || !this.dataConn?.open) return false;
+    if (!this.throttle()) return true;
+
+    this.frameCount++;
+    // Keyframes are costly with real video, so the periodic one is far rarer than for the still-image codecs (peers ask for one if they lose sync).
+    const forceKey = this.needKeyframe || this.kindChanged(7) || this.frameCount === 1 || this.frameCount % 150 === 1;
+    const tier = VIDEO_TIERS[this.qualityLevel];
+    if (this.videoTx.encode(rgba, w, h, codec, tier.bitrate, this.targetFps, forceKey) && forceKey) this.needKeyframe = false;
+    return true;
+  }
+
+  /** Encoded video packets leave here (asynchronously). Never size-gated: dropping a delta frame would corrupt everything after it. */
+  private dispatchVideo(buf: ArrayBuffer, key: boolean) {
+    if (!this.dataConn?.open) return;
+    const buffered = this.dataConn.dataChannel?.bufferedAmount ?? 0;
+    if (buffered > BUFFERED_AMOUNT_CRITICAL) {
+      this.recentDrops++; this.needKeyframe = true; // chain broken → restart it with a keyframe
+    } else {
+      this.recentSends++;
+      try {
+        this.dataConn.send(buf);
+        if (key) this.framesSinceKey = 0; else this.framesSinceKey++;
+        this.consecutiveDrops = 0;
+      } catch { this.recentDrops++; this.needKeyframe = true; }
+    }
+    this.qualityCheckCounter++;
+    if (this.qualityCheckCounter >= this.CHECK_FRAMES) { this.adaptQuality(); this.qualityCheckCounter = 0; this.recentSends = 0; this.recentDrops = 0; }
+  }
+
   private throttle(): boolean {
     const now = performance.now();
     const minInterval = 1000 / this.targetFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
@@ -689,6 +769,7 @@ export class CallManager {
     this.prevSentColorIdx = null;
     this.prevRecvFrame = null;
     this.adaptEnc.reset(); this.adaptDec.reset();
+    this.videoTx.reset(); this.videoRx.reset(); this.remoteDec = null; this.videoDisabled = false;
     this.lastKind = 0;
     this.frameCount = 0;
     try { this.dataConn?.close(); }  catch { /* noop */ }
