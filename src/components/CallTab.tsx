@@ -14,6 +14,10 @@ interface Props {
   inviteCode?: string;
   /** Called once the invite has been used (or the call ended) so the URL can drop back to /call. */
   onInviteConsumed?: () => void;
+  /** False while another tab is showing: the call (camera, mic, sending frames) keeps running, only painting pauses. */
+  active?: boolean;
+  /** Reports whether a call screen (waiting / in-call) is up, so the app can show a "call in progress" indicator elsewhere. */
+  onLiveChange?: (live: boolean) => void;
 }
 
 type Screen = "home" | "starting" | "in-call";
@@ -496,7 +500,7 @@ const IconMicOff = (
   </svg>
 );
 
-export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteConsumed }: Props) {
+export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteConsumed, active = true, onLiveChange }: Props) {
   const videoRef      = useRef<HTMLVideoElement>(null);
   const audioRef      = useRef<HTMLAudioElement>(null);
   const offscreen     = useRef(document.createElement("canvas"));
@@ -526,6 +530,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const mutedRef      = useRef(false);
   const camOffRef     = useRef(false);
   const callModeRef   = useRef<CallMode>("color");
+  const activeRef     = useRef(active);
+  const lastRemote    = useRef<RemoteFrame | null>(null);
+  const [confirmEnd,  setConfirmEnd]  = useState(false);
+  const confirmTimer  = useRef(0);
   const rgbaBuf       = useRef(new Uint8ClampedArray(0));
   const previewQuant  = useRef(new ColorQuantizer());
   const previewFrameN = useRef(0);
@@ -664,11 +672,12 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         if (!remoteHereRef.current) { remoteHereRef.current = true; setRemoteHere(true); setPeerHungUp(false); }
         // Paint at most once per display frame, always the newest — a burst after a stall no longer costs N full repaints.
         pendingRemote.current = f;
+        lastRemote.current = f;
         if (!remoteRaf.current) {
           remoteRaf.current = requestAnimationFrame(() => {
             remoteRaf.current = 0;
             const fr = pendingRemote.current; pendingRemote.current = null;
-            if (fr && remotePreRef.current) paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
+            if (fr && remotePreRef.current && activeRef.current) paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
           });
         }
       },
@@ -718,6 +727,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     lastPreviewRef.current = now;
 
     const callMode = callModeRef.current;
+    const show = activeRef.current;
     const isMirror = facingRef.current === "user";
 
     const base  = callMode === "color" ? remoteFitColorRef.current : remoteFitRef.current; // Pixel uses the character grid, like ASCII
@@ -734,8 +744,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     if (callMode === "color") {
       const img = sampleColorFrame(video, colorCanvas.current, pip.cols, pip.rows, isMirror);
       if (img) {
-        paintCanvas(pre, localAreaRef.current, img);
-        localAreaRef.current?.classList.remove("call-area-dark");
+        if (show) { paintCanvas(pre, localAreaRef.current, img); localAreaRef.current?.classList.remove("call-area-dark"); }
         if (mgr?.isConnected) mgr.sendColorFrame(img.data, img.width, img.height);
         produced = true;
       }
@@ -746,7 +755,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         let q: { palette: Uint8Array; indices: Uint8Array } | null = null;
         if (mgr?.isConnected) q = mgr.sendColorFrame(img.data, img.width, img.height, true);
         else { const lq = previewQuant.current.quantize(img.data, n, previewFrameN.current++ % 45 === 0); q = { palette: lq.palette, indices: lq.indices }; }
-        if (q) { paintPixelBlocks(pre, localAreaRef.current, img.width, img.height, q.palette, q.indices); produced = true; }
+        if (q) { if (show) paintPixelBlocks(pre, localAreaRef.current, img.width, img.height, q.palette, q.indices); produced = true; }
       }
     } else {
       const o = optsRef.current;
@@ -771,14 +780,14 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
             const lq = previewQuant.current.quantize(rgbaBuf.current, N, previewFrameN.current++ % 45 === 0);
             q = { palette: lq.palette, indices: lq.indices };
           }
-          if (q) { paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices); produced = true; }
+          if (q) { if (show) paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices); produced = true; }
         }
       } else {
         const result = renderToString(video, offscreen.current, ropts, isMirror, "text");
         if (result) {
           const { w, h } = getPoolDims();
           if (w > 0 && h > 0) {
-            paintText(pre, localAreaRef.current, result.html, w, h);
+            if (show) paintText(pre, localAreaRef.current, result.html, w, h);
             if (mgr?.isConnected) {
               const raw = getPoolCharIdx();
               mgr.sendAsciiFrame(raw.length === w * h ? raw : raw.subarray(0, w * h), w, h, sortCharsetByDensity(cs));
@@ -803,6 +812,21 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     if (screen !== "home") rafRef.current = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(rafRef.current);
   }, [screen, renderLoop]);
+
+  // The call survives tab switches (App keeps this component mounted); while hidden we keep capturing + sending but skip painting.
+  useEffect(() => {
+    activeRef.current = active;
+    if (!active) return;
+    const id = requestAnimationFrame(() => {
+      layoutEpoch++; // the panels were display:none — re-measure everything
+      updateCallFontSize();
+      if (lastRemote.current && remotePreRef.current) paintRemote(lastRemote.current, remotePreRef.current, remoteAreaRef.current);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [active, updateCallFontSize]);
+
+  useEffect(() => { onLiveChange?.(screen !== "home"); }, [screen, onLiveChange]);
+  useEffect(() => () => { onLiveChange?.(false); clearTimeout(confirmTimer.current); }, [onLiveChange]);
 
   // Every screen renders its own <video>, so the stream attached before a screen change is left on an unmounted element —
   // re-attach it to the new one (this is why the camera stayed blank after connecting until Flip re-ran startCam).
@@ -962,7 +986,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     if (videoRef.current)  videoRef.current.srcObject = null;
     clearPre(localPreRef.current);
     clearPre(remotePreRef.current);
-    remoteHereRef.current = false;
+    remoteHereRef.current = false; lastRemote.current = null;
     setScreen("home"); setCallStatus("idle"); setRemoteHere(false);
     setPeerHungUp(false); setRemoteMuted(false); setRemoteCamOff(false);
     setMode(null); setMyCode(""); setJoinVal(""); setFps(0); fpsT.current = [];
@@ -970,6 +994,15 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     resetTemporalSmoothing();
     setTimeout(initMgr, 300);
     if (inviteCode) onInviteConsumed?.();
+  };
+
+  /** Ending a live call takes two taps (3 s window) — a stray touch shouldn't hang up on someone. */
+  const requestEnd = () => {
+    if (confirmEnd) { clearTimeout(confirmTimer.current); setConfirmEnd(false); endCall(); return; }
+    setConfirmEnd(true);
+    clearTimeout(confirmTimer.current);
+    confirmTimer.current = window.setTimeout(() => setConfirmEnd(false), 3000);
+    try { navigator.vibrate?.(18); } catch { /* not supported */ }
   };
 
   const callLink = () => `${window.location.origin}/call/${myCode}`;
@@ -1250,9 +1283,9 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
           <span className="call-circle-label">{fullscreen ? "Exit" : "Full"}</span>
         </button>
 
-        <button className="call-circle-btn call-circle-end" onClick={endCall} title="End call">
+        <button className={`call-circle-btn call-circle-end${confirmEnd ? " call-circle-confirm" : ""}`} onClick={requestEnd} title={confirmEnd ? "Tap again to end the call" : "End call"}>
           <span className="call-circle-icon">{IconEndCall}</span>
-          <span className="call-circle-label">End</span>
+          <span className="call-circle-label">{confirmEnd ? "Tap again" : "End"}</span>
         </button>
       </div>
     </div>
