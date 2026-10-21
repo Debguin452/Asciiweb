@@ -1,17 +1,16 @@
 export interface GovernorState {
   level: number;
   lowLight: boolean;
-  previewDivisor: number;
   scaleMul: number;
   fpsCap: number;
 }
 
 const LEVELS: Omit<GovernorState, "level">[] = [
-  { lowLight: true,  previewDivisor: 1, scaleMul: 1,    fpsCap: 60 },
-  { lowLight: true,  previewDivisor: 2, scaleMul: 1,    fpsCap: 60 },
-  { lowLight: true,  previewDivisor: 2, scaleMul: 0.8,  fpsCap: 60 },
-  { lowLight: true,  previewDivisor: 3, scaleMul: 0.65, fpsCap: 24 },
-  { lowLight: false, previewDivisor: 4, scaleMul: 0.5,  fpsCap: 15 },
+  { lowLight: true,  scaleMul: 1,    fpsCap: 60 },
+  { lowLight: true,  scaleMul: 0.85, fpsCap: 60 },
+  { lowLight: true,  scaleMul: 0.7,  fpsCap: 60 },
+  { lowLight: false, scaleMul: 0.55, fpsCap: 60 },
+  { lowLight: false, scaleMul: 0.55, fpsCap: 20 },
 ];
 
 const MAX_LEVEL = LEVELS.length - 1;
@@ -25,6 +24,8 @@ const SPIKE_RATIO = 2.5;
 const SPIKES_TO_PANIC = 3;
 const SPIKE_WINDOW = 1000;
 const MAX_BACKOFF = 60000;
+const SELF_SHARE = 0.12;
+const SELF_MAX_INTERVAL = 250;
 
 export class FrameGovernor {
   private level = 0;
@@ -37,6 +38,9 @@ export class FrameGovernor {
   private holdUntil = 0;
   private backoff = 8000;
   private spikes: number[] = [];
+  private selfMs = 0;
+  private lastSelf = 0;
+  private frameSelf = 0;
   private listener: ((s: GovernorState) => void) | null = null;
 
   state: GovernorState = { level: 0, ...LEVELS[0] };
@@ -46,6 +50,7 @@ export class FrameGovernor {
   reset() {
     this.sendLoad = 0; this.paintMs = 0; this.highSince = 0; this.lowSince = 0;
     this.spikes.length = 0; this.backoff = 8000; this.holdUntil = 0;
+    this.selfMs = 0; this.lastSelf = 0; this.frameSelf = 0;
     this.apply(0, performance.now());
   }
 
@@ -54,7 +59,21 @@ export class FrameGovernor {
     this.paintMs += (ms - this.paintMs) * 0.1;
   }
 
-  noteWork(workMs: number, budgetMs: number, now: number) {
+  shouldPaintSelf(now: number): boolean {
+    const interval = Math.min(SELF_MAX_INTERVAL, this.selfMs / SELF_SHARE);
+    return now - this.lastSelf >= interval;
+  }
+
+  noteSelfPaint(ms: number, now: number) {
+    if (!(ms >= 0) || ms > 1000) return;
+    this.selfMs += (ms - this.selfMs) * 0.2;
+    this.lastSelf = now;
+    this.frameSelf += ms;
+  }
+
+  noteWork(rawMs: number, budgetMs: number, now: number) {
+    const workMs = Math.max(0, rawMs - this.frameSelf);
+    this.frameSelf = 0;
     if (!(workMs >= 0) || !(budgetMs > 0) || workMs > 2000) return;
     this.sendLoad += (workMs / budgetMs - this.sendLoad) * 0.1;
     const load = this.sendLoad + this.paintMs / budgetMs;

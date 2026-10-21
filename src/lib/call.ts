@@ -124,7 +124,6 @@ export interface CallManagerEvents {
   onRemoteStream: (stream: MediaStream) => void;
   onRemoteState?: (state: RemoteState) => void;
   onQualityChange?: (level: CallQualityLevel, step: CallQualityStep) => void;
-  onEncoderReset?: () => void;
   onIdChanged?: (newId: string, oldId: string) => void;
 }
 
@@ -657,22 +656,6 @@ export class CallManager {
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
-  prepareAdaptive(pixel: boolean): { force: boolean; budget: number } | null {
-    if (!this.dataConn?.open) return null;
-    if (!this.throttle()) return null;
-    this.frameCount++;
-    return { force: this.shouldForceKeyframe() || this.kindChanged(pixel ? 6 : 5), budget: Math.round(this.maxFrameSize * 0.8) };
-  }
-
-  commitAdaptive(buf: ArrayBuffer, force: boolean) {
-    this.dispatch(buf, null, null, force);
-  }
-
-  resyncVideo() {
-    this.adaptEnc.reset();
-    this.needKeyframe = true;
-  }
-
   /** The codec both peers can use for real-video Color mode, or null (→ use the quadtree codec). */
   private get videoCodec(): VideoCodecId | null {
     if (this.videoDisabled || !this.remoteDec || !this.videoTx.usable) return null;
@@ -789,7 +772,7 @@ export class CallManager {
     this.prevSentIndices = null;
     this.prevSentColorIdx = null;
     this.prevRecvFrame = null;
-    this.adaptEnc.reset(); this.adaptDec.reset(); this.events.onEncoderReset?.();
+    this.adaptEnc.reset(); this.adaptDec.reset();
     this.videoTx.reset(); this.videoRx.reset(); this.remoteDec = null; this.videoDisabled = false;
     this.lastKind = 0;
     this.frameCount = 0;
