@@ -9,7 +9,6 @@ import { CallManager, type CallStatus, type RemoteState } from "../lib/call";
 import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
 import { enhance } from "../lib/enhance";
 import { FrameGovernor } from "../lib/governor";
-import { CapturePipeline } from "../lib/capture";
 
 interface Props {
   opts: AsciiOptions;
@@ -92,7 +91,7 @@ function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, 
 
 /** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
 /** `square`: cells are square pixels (adaptive Color mode) rather than character-shaped cells. */
-function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData | HTMLCanvasElement, square = false, pixelated = false) {
+function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageData | HTMLCanvasElement, square = false, pixelated = false, enhanceFrame = true) {
   const cv = overlayCanvas(pre);
   if (pre.dataset.m !== "c" || pre.firstChild) { pre.textContent = ""; lastHtml.delete(pre); pre.dataset.m = "c"; }
   if (cv.style.display !== "block") cv.style.display = "block";
@@ -104,9 +103,9 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   const cctx = cv.getContext("2d", { willReadFrequently: true })!;
   if (img instanceof HTMLCanvasElement) {
     cctx.drawImage(img, 0, 0);
-    const out = pixelated ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
+    const out = pixelated || !enhanceFrame ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
     if (out) cctx.putImageData(out, 0, 0);
-  } else cctx.putImageData((pixelated ? null : enhance(img.data, w, h)) ?? img, 0, 0);
+  } else cctx.putImageData((pixelated || !enhanceFrame ? null : enhance(img.data, w, h)) ?? img, 0, 0);
   const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
@@ -547,9 +546,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const qualityScaleRef = useRef(1);
   const lastResChangeRef = useRef(0);
   const governor = useRef(new FrameGovernor());
-  const capture = useRef(new CapturePipeline());
-  const lastVideoTimeRef = useRef(-1);
-  const previewTickRef = useRef(0);
   const myIdRef       = useRef("");
   const roomRef       = useRef("");
   const modeRef       = useRef<Mode>(null);
@@ -732,7 +728,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         // large, slow frames (or dropped them) at a fixed resolution.
         qualityScaleRef.current = step.resScale;
       },
-      onEncoderReset: () => capture.current.resetEncoder(),
       onIdChanged: (newId, oldId) => {
         myIdRef.current = newId;
         if (roomRef.current) apiUpdatePeerId(roomRef.current, oldId, newId).catch(() => {});
@@ -746,11 +741,9 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
   useEffect(() => {
     const g = governor.current;
-    const cap = capture.current;
     g.onChange(s => callRef.current?.setFpsCap(s.fpsCap));
     g.reset();
-    cap.onFail = () => callRef.current?.resyncVideo();
-    return () => { g.onChange(() => {}); cap.onFail = null; cap.dispose(); };
+    return () => g.onChange(() => {});
   }, []);
 
   const accountFrame = useCallback((startedAt: number, workMs: number) => {
@@ -776,16 +769,11 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     const mgr = callRef.current;
     const now = performance.now();
     const callMode = callModeRef.current;
-    const cap = capture.current;
-    const pipelined = (callMode === "color" || callMode === "pixel") && cap.usable;
-    if (pipelined && cap.busy) return;
     if (mgr?.isConnected) { if (!mgr.isSendDue()) return; }
     else if (now - lastPreviewRef.current < 66) return;
-    if (video.currentTime === lastVideoTimeRef.current) return;
-    lastVideoTimeRef.current = video.currentTime;
     lastPreviewRef.current = now;
     const gov = governor.current.state;
-    const show = activeRef.current && (previewTickRef.current++ % gov.previewDivisor === 0);
+    const show = activeRef.current && governor.current.shouldPaintSelf(now);
 
     const isMirror = facingRef.current === "user";
 
@@ -799,30 +787,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     }
     const pip = sendFitRef.current;
 
-    if (pipelined) {
-      const plan = callMode === "color" && mgr?.isConnected ? mgr.videoPlan(video.videoWidth, video.videoHeight, gov.scaleMul) : null;
-      const long = callMode === "pixel"
-        ? Math.max(40, Math.min(96, Math.round(96 * scale / 8) * 8))
-        : Math.max(96, Math.min(192, Math.round(192 * gov.scaleMul / 8) * 8));
-      const d = plan ?? adaptiveDims(video.videoWidth, video.videoHeight, long);
-      const prep = !plan && mgr?.isConnected ? mgr.prepareAdaptive(callMode === "pixel") : null;
-      const job = prep ? { ...prep, pixel: callMode === "pixel" } : null;
-      cap.submit(video, { w: d.w, h: d.h, mirror: isMirror, lowLight: gov.lowLight, encode: job }).then(res => {
-        if (!res) return;
-        const img = new ImageData(res.rgba, res.w, res.h);
-        if (show) {
-          paintCanvas(pre, localAreaRef.current, img, true, callMode === "pixel");
-          localAreaRef.current?.classList.remove("call-area-dark");
-        }
-        if (mgr?.isConnected) {
-          if (res.packet && job) mgr.commitAdaptive(res.packet, job.force);
-          else if (plan) mgr.sendVideoFrame(img.data, img.width, img.height);
-        }
-        accountFrame(now, performance.now() - now);
-      });
-      return;
-    }
-
     let produced = false;
     if (callMode === "color") {
       // Real video (WebCodecs) when both peers support it: far better quality per byte, and it uses a bigger capture size.
@@ -832,7 +796,12 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
         if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
-        if (show) { paintCanvas(pre, localAreaRef.current, img, true); localAreaRef.current?.classList.remove("call-area-dark"); }
+        if (show) {
+          const t = performance.now();
+          paintCanvas(pre, localAreaRef.current, img, true, false, false);
+          governor.current.noteSelfPaint(performance.now() - t, t);
+          localAreaRef.current?.classList.remove("call-area-dark");
+        }
         if (mgr?.isConnected) {
           if (!(plan && mgr.sendVideoFrame(img.data, img.width, img.height))) {
             if (plan) { /* video just became unusable — this frame is at the video size, so let the next one use the quadtree grid */ }
@@ -848,7 +817,12 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
         if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
-        if (show) { paintCanvas(pre, localAreaRef.current, img, true, true); localAreaRef.current?.classList.remove("call-area-dark"); }
+        if (show) {
+          const t = performance.now();
+          paintCanvas(pre, localAreaRef.current, img, true, true, false);
+          governor.current.noteSelfPaint(performance.now() - t, t);
+          localAreaRef.current?.classList.remove("call-area-dark");
+        }
         if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height, true);
         produced = true;
       }
@@ -875,14 +849,25 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
             const lq = previewQuant.current.quantize(rgbaBuf.current, N, previewFrameN.current++ % 45 === 0);
             q = { palette: lq.palette, indices: lq.indices };
           }
-          if (q) { if (show) paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices); produced = true; }
+          if (q) {
+            if (show) {
+              const t = performance.now();
+              paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices);
+              governor.current.noteSelfPaint(performance.now() - t, t);
+            }
+            produced = true;
+          }
         }
       } else {
         const result = renderToString(video, offscreen.current, ropts, isMirror, "text");
         if (result) {
           const { w, h } = getPoolDims();
           if (w > 0 && h > 0) {
-            if (show) paintText(pre, localAreaRef.current, result.html, w, h);
+            if (show) {
+              const t = performance.now();
+              paintText(pre, localAreaRef.current, result.html, w, h);
+              governor.current.noteSelfPaint(performance.now() - t, t);
+            }
             if (mgr?.isConnected) {
               const raw = getPoolCharIdx();
               mgr.sendAsciiFrame(raw.length === w * h ? raw : raw.subarray(0, w * h), w, h, sortCharsetByDensity(cs));
@@ -939,8 +924,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   // the same thing automatically instead of making the person notice and
   // back out manually.
   const startCam = async (face: Facing = facing): Promise<boolean> => {
-    lowLight.current.reset();
-    capture.current.resetLight(); // new camera/stream: forget the old noise reading and running average
+    lowLight.current.reset(); // new camera/stream: forget the old noise reading and running average
     setCamErr(null);
     if (videoRef.current) videoRef.current.srcObject = null;
     // Keep the live mic track across camera flips: the call's audio sender is bound to that exact track,
