@@ -124,6 +124,7 @@ export interface CallManagerEvents {
   onRemoteStream: (stream: MediaStream) => void;
   onRemoteState?: (state: RemoteState) => void;
   onQualityChange?: (level: CallQualityLevel, step: CallQualityStep) => void;
+  onEncoderReset?: () => void;
   onIdChanged?: (newId: string, oldId: string) => void;
 }
 
@@ -539,11 +540,15 @@ export class CallManager {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
+  private fpsCap = 60;
+  setFpsCap(cap: number) { this.fpsCap = Math.max(5, cap); }
+  get currentFps() { return Math.min(this.targetFps, this.fpsCap); }
+
   /** True when a new frame should be produced now. Callers check this BEFORE doing capture/convert work, so no CPU is spent on frames that would be throttled away. */
   isSendDue(): boolean {
     if (!this.dataConn?.open) return false;
     const now = performance.now();
-    if (this.lastSentAt > 0 && now - this.lastSentAt < 1000 / this.targetFps - 2) return false;
+    if (this.lastSentAt > 0 && now - this.lastSentAt < 1000 / Math.min(this.targetFps, this.fpsCap) - 2) return false;
     return (this.dataConn?.dataChannel?.bufferedAmount ?? 0) <= BUFFERED_AMOUNT_CRITICAL;
   }
 
@@ -652,6 +657,22 @@ export class CallManager {
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
+  prepareAdaptive(pixel: boolean): { force: boolean; budget: number } | null {
+    if (!this.dataConn?.open) return null;
+    if (!this.throttle()) return null;
+    this.frameCount++;
+    return { force: this.shouldForceKeyframe() || this.kindChanged(pixel ? 6 : 5), budget: Math.round(this.maxFrameSize * 0.8) };
+  }
+
+  commitAdaptive(buf: ArrayBuffer, force: boolean) {
+    this.dispatch(buf, null, null, force);
+  }
+
+  resyncVideo() {
+    this.adaptEnc.reset();
+    this.needKeyframe = true;
+  }
+
   /** The codec both peers can use for real-video Color mode, or null (→ use the quadtree codec). */
   private get videoCodec(): VideoCodecId | null {
     if (this.videoDisabled || !this.remoteDec || !this.videoTx.usable) return null;
@@ -660,9 +681,9 @@ export class CallManager {
   }
 
   /** Capture size for real-video Color mode at the current quality tier, or null when it isn't available. */
-  videoPlan(vw: number, vh: number): { w: number; h: number } | null {
+  videoPlan(vw: number, vh: number, scale = 1): { w: number; h: number } | null {
     if (this.videoCodec === null || !this.dataConn?.open) return null;
-    return videoDims(vw, vh, VIDEO_TIERS[this.qualityLevel].long);
+    return videoDims(vw, vh, Math.max(96, Math.round(VIDEO_TIERS[this.qualityLevel].long * scale / 16) * 16));
   }
 
   /**
@@ -702,7 +723,7 @@ export class CallManager {
 
   private throttle(): boolean {
     const now = performance.now();
-    const minInterval = 1000 / this.targetFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
+    const minInterval = 1000 / this.currentFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
     if (this.lastSentAt > 0 && now - this.lastSentAt < minInterval) return false;
 
     const buffered = this.dataConn?.dataChannel?.bufferedAmount ?? 0;
@@ -768,7 +789,7 @@ export class CallManager {
     this.prevSentIndices = null;
     this.prevSentColorIdx = null;
     this.prevRecvFrame = null;
-    this.adaptEnc.reset(); this.adaptDec.reset();
+    this.adaptEnc.reset(); this.adaptDec.reset(); this.events.onEncoderReset?.();
     this.videoTx.reset(); this.videoRx.reset(); this.remoteDec = null; this.videoDisabled = false;
     this.lastKind = 0;
     this.frameCount = 0;

@@ -1,7 +1,7 @@
 const SHARPEN = 0.85;
 const HALO_LIMIT = 28;
 const CONTRAST = 1.15;
-const SATURATION = 1.22;
+const SATURATION = 1.2;
 
 const contrastLut = new Uint8ClampedArray(256);
 for (let i = 0; i < 256; i++) contrastLut[i] = (i - 128) * CONTRAST + 128;
@@ -9,7 +9,11 @@ for (let i = 0; i < 256; i++) contrastLut[i] = (i - 128) * CONTRAST + 128;
 let luma = new Uint8ClampedArray(0);
 let out: ImageData | null = null;
 
-export function enhance(src: Uint8ClampedArray, w: number, h: number): ImageData {
+export function enhance(src: Uint8ClampedArray, w: number, h: number): ImageData | null {
+  try { return run(src, w, h); } catch { return null; }
+}
+
+function run(src: Uint8ClampedArray, w: number, h: number): ImageData {
   const n = w * h;
   if (!out || out.width !== w || out.height !== h) out = new ImageData(w, h);
   if (luma.length !== n) luma = new Uint8ClampedArray(n);
