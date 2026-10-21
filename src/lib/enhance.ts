@@ -1,7 +1,7 @@
-const SHARPEN = 0.7;
+const SHARPEN = 0.8;
 const HALO_LIMIT = 28;
-const CONTRAST = 1.08;
-const SATURATION = 1.15;
+const CONTRAST = 1.10;
+const SATURATION = 1.2;
 
 const contrastLut = new Uint8ClampedArray(256);
 for (let i = 0; i < 256; i++) contrastLut[i] = (i - 128) * CONTRAST + 128;
