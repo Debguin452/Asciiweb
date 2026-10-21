@@ -8,6 +8,8 @@ import {
 import { CallManager, type CallStatus, type RemoteState } from "../lib/call";
 import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
 import { enhance } from "../lib/enhance";
+import { FrameGovernor } from "../lib/governor";
+import { CapturePipeline } from "../lib/capture";
 
 interface Props {
   opts: AsciiOptions;
@@ -102,8 +104,9 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   const cctx = cv.getContext("2d", { willReadFrequently: true })!;
   if (img instanceof HTMLCanvasElement) {
     cctx.drawImage(img, 0, 0);
-    if (!pixelated) cctx.putImageData(enhance(cctx.getImageData(0, 0, w, h).data, w, h), 0, 0);
-  } else cctx.putImageData(pixelated ? img : enhance(img.data, w, h), 0, 0);
+    const out = pixelated ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
+    if (out) cctx.putImageData(out, 0, 0);
+  } else cctx.putImageData((pixelated ? null : enhance(img.data, w, h)) ?? img, 0, 0);
   const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
@@ -543,6 +546,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const sendFitRef    = useRef({ cols: 60, rows: 34 }); // actual capture/send grid — see renderLoop
   const qualityScaleRef = useRef(1);
   const lastResChangeRef = useRef(0);
+  const governor = useRef(new FrameGovernor());
+  const capture = useRef(new CapturePipeline());
+  const lastVideoTimeRef = useRef(-1);
+  const previewTickRef = useRef(0);
   const myIdRef       = useRef("");
   const roomRef       = useRef("");
   const modeRef       = useRef<Mode>(null);
@@ -696,7 +703,11 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
           remoteRaf.current = requestAnimationFrame(() => {
             remoteRaf.current = 0;
             const fr = pendingRemote.current; pendingRemote.current = null;
-            if (fr && remotePreRef.current && activeRef.current) paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
+            if (fr && remotePreRef.current && activeRef.current) {
+              const t0 = performance.now();
+              paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
+              governor.current.notePaint(performance.now() - t0);
+            }
           });
         }
       },
@@ -721,6 +732,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         // large, slow frames (or dropped them) at a fixed resolution.
         qualityScaleRef.current = step.resScale;
       },
+      onEncoderReset: () => capture.current.resetEncoder(),
       onIdChanged: (newId, oldId) => {
         myIdRef.current = newId;
         if (roomRef.current) apiUpdatePeerId(roomRef.current, oldId, newId).catch(() => {});
@@ -732,6 +744,28 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
   useEffect(() => { initMgr(); return () => callRef.current?.hangup(); }, [initMgr]);
 
+  useEffect(() => {
+    const g = governor.current;
+    const cap = capture.current;
+    g.onChange(s => callRef.current?.setFpsCap(s.fpsCap));
+    g.reset();
+    cap.onFail = () => callRef.current?.resyncVideo();
+    return () => { g.onChange(() => {}); cap.onFail = null; cap.dispose(); };
+  }, []);
+
+  const accountFrame = useCallback((startedAt: number, workMs: number) => {
+    const mgr = callRef.current;
+    const gov = governor.current.state;
+    const target = Math.min(mgr?.isConnected ? mgr.currentFps : 30, gov.fpsCap, 30);
+    governor.current.noteWork(workMs, 1000 / target, performance.now());
+    fpsT.current.push(startedAt);
+    if (fpsT.current.length > 30) fpsT.current.shift();
+    if (fpsT.current.length > 1 && startedAt - lastFpsSetRef.current > 500) {
+      lastFpsSetRef.current = startedAt;
+      setFps(Math.round((fpsT.current.length - 1) / ((startedAt - fpsT.current[0]) / 1000)));
+    }
+  }, []);
+
   const renderLoop = useCallback(() => {
     rafRef.current = requestAnimationFrame(renderLoop);
     const video = videoRef.current, pre = localPreRef.current;
@@ -741,16 +775,22 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     // This used to run at the display refresh rate (60-120 Hz) and discard most of the work in the send throttle.
     const mgr = callRef.current;
     const now = performance.now();
+    const callMode = callModeRef.current;
+    const cap = capture.current;
+    const pipelined = (callMode === "color" || callMode === "pixel") && cap.usable;
+    if (pipelined && cap.busy) return;
     if (mgr?.isConnected) { if (!mgr.isSendDue()) return; }
     else if (now - lastPreviewRef.current < 66) return;
+    if (video.currentTime === lastVideoTimeRef.current) return;
+    lastVideoTimeRef.current = video.currentTime;
     lastPreviewRef.current = now;
+    const gov = governor.current.state;
+    const show = activeRef.current && (previewTickRef.current++ % gov.previewDivisor === 0);
 
-    const callMode = callModeRef.current;
-    const show = activeRef.current;
     const isMirror = facingRef.current === "user";
 
     const base  = callMode === "color" ? remoteFitColorRef.current : remoteFitRef.current; // Pixel uses the character grid, like ASCII
-    const scale = qualityScaleRef.current;
+    const scale = qualityScaleRef.current * gov.scaleMul;
     const cols  = Math.max(14, Math.round(base.cols * scale));
     const rows  = Math.max(8,  Math.round(base.rows * scale));
     if ((cols !== sendFitRef.current.cols || rows !== sendFitRef.current.rows) && now - lastResChangeRef.current > 1200) {
@@ -759,15 +799,39 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     }
     const pip = sendFitRef.current;
 
+    if (pipelined) {
+      const plan = callMode === "color" && mgr?.isConnected ? mgr.videoPlan(video.videoWidth, video.videoHeight, gov.scaleMul) : null;
+      const long = callMode === "pixel"
+        ? Math.max(40, Math.min(96, Math.round(96 * scale / 8) * 8))
+        : Math.max(96, Math.min(192, Math.round(192 * gov.scaleMul / 8) * 8));
+      const d = plan ?? adaptiveDims(video.videoWidth, video.videoHeight, long);
+      const prep = !plan && mgr?.isConnected ? mgr.prepareAdaptive(callMode === "pixel") : null;
+      const job = prep ? { ...prep, pixel: callMode === "pixel" } : null;
+      cap.submit(video, { w: d.w, h: d.h, mirror: isMirror, lowLight: gov.lowLight, encode: job }).then(res => {
+        if (!res) return;
+        const img = new ImageData(res.rgba, res.w, res.h);
+        if (show) {
+          paintCanvas(pre, localAreaRef.current, img, true, callMode === "pixel");
+          localAreaRef.current?.classList.remove("call-area-dark");
+        }
+        if (mgr?.isConnected) {
+          if (res.packet && job) mgr.commitAdaptive(res.packet, job.force);
+          else if (plan) mgr.sendVideoFrame(img.data, img.width, img.height);
+        }
+        accountFrame(now, performance.now() - now);
+      });
+      return;
+    }
+
     let produced = false;
     if (callMode === "color") {
       // Real video (WebCodecs) when both peers support it: far better quality per byte, and it uses a bigger capture size.
       // Otherwise the adaptive quadtree codec on a 192-px grid.
-      const plan = mgr?.isConnected ? mgr.videoPlan(video.videoWidth, video.videoHeight) : null;
-      const d = plan ?? adaptiveDims(video.videoWidth, video.videoHeight);
+      const plan = mgr?.isConnected ? mgr.videoPlan(video.videoWidth, video.videoHeight, gov.scaleMul) : null;
+      const d = plan ?? adaptiveDims(video.videoWidth, video.videoHeight, Math.max(96, Math.min(192, Math.round(192 * gov.scaleMul / 8) * 8)));
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
-        lowLight.current.process(img.data, img.width, img.height);
+        if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
         if (show) { paintCanvas(pre, localAreaRef.current, img, true); localAreaRef.current?.classList.remove("call-area-dark"); }
         if (mgr?.isConnected) {
           if (!(plan && mgr.sendVideoFrame(img.data, img.width, img.height))) {
@@ -783,7 +847,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       const d = adaptiveDims(video.videoWidth, video.videoHeight, long);
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
-        lowLight.current.process(img.data, img.width, img.height);
+        if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
         if (show) { paintCanvas(pre, localAreaRef.current, img, true, true); localAreaRef.current?.classList.remove("call-area-dark"); }
         if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height, true);
         produced = true;
@@ -829,15 +893,8 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       }
     }
 
-    if (produced) {
-      fpsT.current.push(now);
-      if (fpsT.current.length > 30) fpsT.current.shift();
-      if (fpsT.current.length > 1 && now - lastFpsSetRef.current > 500) {
-        lastFpsSetRef.current = now;
-        setFps(Math.round((fpsT.current.length - 1) / ((now - fpsT.current[0]) / 1000))); // not per frame: it re-renders this whole component
-      }
-    }
-  }, []);
+    if (produced) accountFrame(now, performance.now() - now);
+  }, [accountFrame]);
 
   useEffect(() => {
     if (screen !== "home") rafRef.current = requestAnimationFrame(renderLoop);
@@ -882,7 +939,8 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   // the same thing automatically instead of making the person notice and
   // back out manually.
   const startCam = async (face: Facing = facing): Promise<boolean> => {
-    lowLight.current.reset(); // new camera/stream: forget the old noise reading and running average
+    lowLight.current.reset();
+    capture.current.resetLight(); // new camera/stream: forget the old noise reading and running average
     setCamErr(null);
     if (videoRef.current) videoRef.current.srcObject = null;
     // Keep the live mic track across camera flips: the call's audio sender is bound to that exact track,
