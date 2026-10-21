@@ -7,6 +7,7 @@ import {
 } from "../lib/ascii";
 import { CallManager, type CallStatus, type RemoteState } from "../lib/call";
 import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
+import { enhance } from "../lib/enhance";
 
 interface Props {
   opts: AsciiOptions;
@@ -98,8 +99,11 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   const w = img.width, h = img.height;
   if (cv.width !== w) cv.width = w;
   if (cv.height !== h) cv.height = h;
-  const cctx = cv.getContext("2d")!;
-  if (img instanceof HTMLCanvasElement) cctx.drawImage(img, 0, 0); else cctx.putImageData(img, 0, 0);
+  const cctx = cv.getContext("2d", { willReadFrequently: true })!;
+  if (img instanceof HTMLCanvasElement) {
+    cctx.drawImage(img, 0, 0);
+    if (!pixelated) cctx.putImageData(enhance(cctx.getImageData(0, 0, w, h).data, w, h), 0, 0);
+  } else cctx.putImageData(pixelated ? img : enhance(img.data, w, h), 0, 0);
   const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
