@@ -5,10 +5,11 @@ import {
   getPoolCharIdx, getPoolColors, getPoolDims,
   type AsciiOptions,
 } from "../lib/ascii";
-import { CallManager, type CallStatus, type RemoteState } from "../lib/call";
+import { CallManager, MAX_REMOTE_PEERS, type CallStatus, type RemoteState } from "../lib/call";
 import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
 import { enhance } from "../lib/enhance";
 import { FrameGovernor } from "../lib/governor";
+import CallGrid, { type GridTile } from "./CallGrid";
 
 interface Props {
   opts: AsciiOptions;
@@ -293,7 +294,9 @@ async function apiUpdatePeerId(code: string, oldPeerId: string, newPeerId: strin
   } catch { /* noop — reconnect will still try the stale id, which is fine if signaling recovers */ }
 }
 
-async function apiJoin(code: string, peerId: string, attempts = 4): Promise<string | null> {
+/** Returns every other participant currently in the room (join order as the server has it), so a 3rd/4th joiner connects
+ *  to everyone already there — not just whoever happened to be first, which is all a 2-person call ever needed. */
+async function apiJoin(code: string, peerId: string, attempts = 4): Promise<string[] | null> {
   for (let i = 0; i < attempts; i++) {
     try {
       const r = await fetch(`/api/rooms/${code}`, {
@@ -303,8 +306,9 @@ async function apiJoin(code: string, peerId: string, attempts = 4): Promise<stri
       });
       if (r.ok) {
         const d = await r.json() as { peers?: string[] };
-        const host = (d.peers ?? []).find(p => p !== peerId);
-        if (host) return host;
+        const others = (d.peers ?? []).filter(p => p !== peerId);
+        if (others.length) return others;
+        return null; // room exists but we're somehow the only one in it — nothing to connect to
       } else if (r.status === 404) {
         // Room may not have propagated to this edge node yet — worth a retry.
       } else {
@@ -520,6 +524,24 @@ const IconMicOff = (
   </svg>
 );
 
+/** One remote participant's tile content — CallGrid places this wherever that participant belongs in the current layout
+ *  (big, small, or a grid cell); it only has to register its own DOM nodes so the imperative paint path (onRemoteFrame,
+ *  see initMgr below) can find them. It remounts (fresh DOM) whenever CallGrid's layout mode changes — registerPre/Area
+ *  handle that by re-painting the last known frame immediately on mount so a tile never sits blank after a layout swap. */
+function RemoteTile({ peerId, registerPre, registerArea, registerAudio }: {
+  peerId: string;
+  registerPre: (id: string, el: HTMLPreElement | null) => void;
+  registerArea: (id: string, el: HTMLDivElement | null) => void;
+  registerAudio: (id: string, el: HTMLAudioElement | null) => void;
+}) {
+  return (
+    <div className="call-tile-area" ref={el => registerArea(peerId, el)}>
+      <pre ref={el => registerPre(peerId, el)} className="ascii-output call-pre-wa" />
+      <audio ref={el => registerAudio(peerId, el)} autoPlay playsInline style={{ display: "none" }} />
+    </div>
+  );
+}
+
 export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteConsumed, active = true, onLiveChange }: Props) {
   const videoRef      = useRef<HTMLVideoElement>(null);
   const audioRef      = useRef<HTMLAudioElement>(null);
@@ -527,8 +549,8 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const colorCanvas   = useRef(document.createElement("canvas"));
   const lowLight      = useRef(new LowLightAssist()); // dim-room denoise for Color/Pixel; does nothing in good light
   const localPreRef   = useRef<HTMLPreElement>(null);
-  const remotePreRef  = useRef<HTMLPreElement>(null);
-  const localAreaRef  = useRef<HTMLDivElement>(null);
+  const localAreaElRef  = useRef<HTMLDivElement | null>(null);
+  const localResizeObsRef = useRef<ResizeObserver | null>(null);
   const remoteAreaRef = useRef<HTMLDivElement>(null);
   const callScreenRef = useRef<HTMLDivElement>(null);
   const rafRef        = useRef(0);
@@ -537,9 +559,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const optsRef       = useRef(opts);
   const remoteFitRef  = useRef({ cols: 60, rows: 34 });
   const remoteFitColorRef = useRef({ cols: 80, rows: 45 });
-  const remoteHereRef = useRef(false);
-  const pendingRemote = useRef<RemoteFrame | null>(null);
-  const remoteRaf     = useRef(0);
   const lastFpsSetRef = useRef(0);
   const lastPreviewRef = useRef(0);
   const sendFitRef    = useRef({ cols: 60, rows: 34 }); // actual capture/send grid — see renderLoop
@@ -553,7 +572,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const camOffRef     = useRef(false);
   const callModeRef   = useRef<CallMode>("color");
   const activeRef     = useRef(active);
-  const lastRemote    = useRef<RemoteFrame | null>(null);
   const [confirmEnd,  setConfirmEnd]  = useState(false);
   const confirmTimer  = useRef(0);
   const rgbaBuf       = useRef(new Uint8ClampedArray(0));
@@ -561,7 +579,24 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const previewFrameN = useRef(0);
   const facingRef     = useRef<Facing>("user");
   const fpsT          = useRef<number[]>([]);
-  const pipDragRef    = useRef<{ startX: number; startY: number; origRight: number; origBottom: number } | null>(null);
+
+  // ── Group-call per-participant bookkeeping. Each remote tile paints into
+  // its own <pre>/area (registered via registerPre/registerArea below) and
+  // keeps its own pending-frame/raf/last-frame state, mirroring exactly what
+  // the old single-remote code did with one fixed ref each — just keyed by
+  // peer id now, since a tile can be unmounted/remounted (a different DOM
+  // node) whenever CallGrid switches layout modes.
+  const remoteTilesRef   = useRef<Map<string, { pre: HTMLPreElement | null; area: HTMLDivElement | null }>>(new Map());
+  const audioElsRef      = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const pendingRemoteRef = useRef<Map<string, RemoteFrame>>(new Map());
+  const remoteRafRef     = useRef<Map<string, number>>(new Map());
+  const lastRemoteRef    = useRef<Map<string, RemoteFrame>>(new Map());
+  const peerResScaleRef  = useRef<Map<string, number>>(new Map());
+  const participantsRef  = useRef<string[]>([]);
+
+  interface PeerUI { muted: boolean; camOff: boolean; hasFrame: boolean; reconnecting: boolean }
+  const DEFAULT_PEER_UI: PeerUI = { muted: false, camOff: false, hasFrame: false, reconnecting: false };
 
   const [screen,       setScreen]       = useState<Screen>("home");
   const [callStatus,   setCallStatus]   = useState<CallStatus>("idle");
@@ -574,10 +609,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const [camOff,       setCamOff]       = useState(false);
   const [facing,       setFacing]       = useState<Facing>("user");
   const [callMode,     setCallMode]     = useState<CallMode>("color");
-  const [remoteHere,   setRemoteHere]   = useState(false);
+  const [participants, setParticipants] = useState<string[]>([]);
+  const [peerUI,       setPeerUI]       = useState<Record<string, PeerUI>>({});
   const [peerHungUp,   setPeerHungUp]   = useState(false);
-  const [remoteMuted,  setRemoteMuted]  = useState(false);
-  const [remoteCamOff, setRemoteCamOff] = useState(false);
+  const [roomFullMsg,  setRoomFullMsg]  = useState(false);
   const [fps,          setFps]          = useState(0);
   const [copied,       setCopied]       = useState(false);
   const [linkCopied,   setLinkCopied]   = useState(false);
@@ -585,7 +620,27 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   const [starting,     setStarting]     = useState(false);
   const [fullscreen,   setFullscreen]   = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [pipPos,       setPipPos]       = useState({ right: 12, bottom: 68 });
+
+  useEffect(() => { participantsRef.current = participants; }, [participants]);
+
+  /** Removes a drop/closed/erroring peer from the call — shared by the "closed"/"error" status handler and onRemoteHangup
+   *  below, since both mean the same thing for the UI. Only shows the "call ended" screen when that was the last person. */
+  const removeParticipant = (peerId: string) => {
+    const wasIn = participantsRef.current.includes(peerId);
+    const wasOnly = wasIn && participantsRef.current.length === 1;
+    setParticipants(prev => prev.filter(id => id !== peerId));
+    if (wasOnly) setPeerHungUp(true);
+    setPeerUI(prev => { if (!(peerId in prev)) return prev; const n = { ...prev }; delete n[peerId]; return n; });
+    const rafId = remoteRafRef.current.get(peerId);
+    if (rafId) cancelAnimationFrame(rafId);
+    remoteRafRef.current.delete(peerId);
+    pendingRemoteRef.current.delete(peerId);
+    lastRemoteRef.current.delete(peerId);
+    remoteTilesRef.current.delete(peerId);
+    audioElsRef.current.delete(peerId);
+    remoteStreamsRef.current.delete(peerId);
+    peerResScaleRef.current.delete(peerId);
+  };
 
   useEffect(() => { optsRef.current    = opts;       }, [opts]);
   useEffect(() => {
@@ -628,7 +683,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     // remoteFitRef is sized to *our own* remote-viewing panel — a reasonable
     // stand-in for "how much detail is actually useful", and the baseline
     // the outgoing capture resolution is built from (see renderLoop). It's
-    // no longer used to set remotePreRef's font size directly: the frames
+    // no longer used to set a remote tile's font size directly: the frames
     // we receive carry their own width/height (the sender's resolution,
     // which can legitimately differ from ours — different screen size, or
     // scaled down under congestion), so that's sized per-frame instead
@@ -644,19 +699,64 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     // (sendFitRef, computed in renderLoop) shrunk to fit its small frame.
     if (localPreRef.current) {
       const { cols, rows } = sendFitRef.current;
-      const fs = fontSizeForGrid(localAreaRef.current, cols, rows);
+      const fs = fontSizeForGrid(localAreaElRef.current, cols, rows);
       localPreRef.current.style.fontSize   = fs + "px";
       localPreRef.current.style.lineHeight = "1.1";
     }
   }, []);
 
+  // The self-preview's wrapping element is NOT stable across a group call: CallGrid remounts it (a new DOM node) every time
+  // the layout mode changes (someone joins/leaves, or a tile is tapped to focus it — including tapping your own camera to
+  // "zoom" it, since that's the same tap-to-swap mechanism). A plain useRef + one-time ResizeObserver.observe() would keep
+  // watching a detached element after a remount, so this is a callback ref instead: it re-attaches the one shared observer
+  // to whatever element is current every time React swaps it in.
+  const setLocalAreaEl = useCallback((el: HTMLDivElement | null) => {
+    const obs = localResizeObsRef.current;
+    if (obs && localAreaElRef.current) obs.unobserve(localAreaElRef.current);
+    localAreaElRef.current = el;
+    if (el) {
+      layoutEpoch++; // almost certainly a new box size — don't wait for a resize event to notice
+      if (!obs) localResizeObsRef.current = new ResizeObserver(updateCallFontSize);
+      localResizeObsRef.current!.observe(el);
+      updateCallFontSize();
+    }
+  }, [updateCallFontSize]);
+
   useEffect(() => {
     const obs = new ResizeObserver(updateCallFontSize);
-    if (localAreaRef.current)  obs.observe(localAreaRef.current);
     if (remoteAreaRef.current) obs.observe(remoteAreaRef.current);
     updateCallFontSize();
     return () => obs.disconnect();
   }, [updateCallFontSize, screen]);
+
+  useEffect(() => () => localResizeObsRef.current?.disconnect(), []);
+
+  /** Registers a remote tile's <pre>/area DOM nodes for peerId so onRemoteFrame can paint straight into them. A tile
+   *  remounts (fresh DOM) whenever CallGrid's layout mode changes, same reasoning as setLocalAreaEl above — repainting the
+   *  last known frame immediately on (re)mount avoids a blank tile for the one frame it'd otherwise take to catch up. */
+  const registerPre = useCallback((id: string, el: HTMLPreElement | null) => {
+    const t = remoteTilesRef.current.get(id) ?? { pre: null, area: null };
+    t.pre = el;
+    remoteTilesRef.current.set(id, t);
+    if (el) {
+      const fr = lastRemoteRef.current.get(id);
+      if (fr) paintRemote(fr, el, remoteTilesRef.current.get(id)?.area ?? null);
+    }
+  }, []);
+  const registerArea = useCallback((id: string, el: HTMLDivElement | null) => {
+    const t = remoteTilesRef.current.get(id) ?? { pre: null, area: null };
+    t.area = el;
+    remoteTilesRef.current.set(id, t);
+  }, []);
+  const registerAudio = useCallback((id: string, el: HTMLAudioElement | null) => {
+    if (el) {
+      audioElsRef.current.set(id, el);
+      const s = remoteStreamsRef.current.get(id);
+      if (s) { el.srcObject = s; el.play().catch(() => {}); }
+    } else {
+      audioElsRef.current.delete(id);
+    }
+  }, []);
 
   useEffect(() => {
     const onChange = () => setFullscreen(!!document.fullscreenElement);
@@ -684,53 +784,70 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
   const initMgr = useCallback(() => {
     const mgr = new CallManager({
-      onStatus: (s, detail) => {
+      onStatus: (peerId, s, detail) => {
         setCallStatus(s);
         if (s === "error")     setConnectErr(detail ?? "Connection failed");
-        if (s === "connected") { setConnectErr(null); setScreen("in-call"); }
+        if (s === "connected") setConnectErr(null);
         if (s === "reconnecting") setConnectErr(null);
+
+        if (peerId === "") return; // signaling-socket-level event (waiting/reconnecting/error on the shared Peer itself)
+
+        if (s === "connected") {
+          setScreen("in-call");
+          setPeerHungUp(false);
+          setParticipants(prev => prev.includes(peerId) ? prev : [...prev, peerId]);
+          setPeerUI(prev => ({ ...prev, [peerId]: prev[peerId] ? { ...prev[peerId], reconnecting: false } : { ...DEFAULT_PEER_UI } }));
+        } else if (s === "closed" || s === "error") {
+          removeParticipant(peerId);
+        } else if (s === "reconnecting") {
+          setPeerUI(prev => ({ ...prev, [peerId]: { ...(prev[peerId] ?? DEFAULT_PEER_UI), reconnecting: true } }));
+        }
       },
-      onRemoteFrame: (f: RemoteFrame) => {
-        if (!remoteHereRef.current) { remoteHereRef.current = true; setRemoteHere(true); setPeerHungUp(false); }
+      onRemoteFrame: (peerId: string, f: RemoteFrame) => {
+        lastRemoteRef.current.set(peerId, f);
+        setPeerUI(prev => (prev[peerId]?.hasFrame ? prev : { ...prev, [peerId]: { ...(prev[peerId] ?? DEFAULT_PEER_UI), hasFrame: true } }));
         // Paint at most once per display frame, always the newest — a burst after a stall no longer costs N full repaints.
-        pendingRemote.current = f;
-        lastRemote.current = f;
-        if (!remoteRaf.current) {
-          remoteRaf.current = requestAnimationFrame(() => {
-            remoteRaf.current = 0;
-            const fr = pendingRemote.current; pendingRemote.current = null;
-            if (fr && remotePreRef.current && activeRef.current) {
+        pendingRemoteRef.current.set(peerId, f);
+        if (!remoteRafRef.current.has(peerId)) {
+          const rafId = requestAnimationFrame(() => {
+            remoteRafRef.current.delete(peerId);
+            const fr = pendingRemoteRef.current.get(peerId); pendingRemoteRef.current.delete(peerId);
+            const tile = remoteTilesRef.current.get(peerId);
+            if (fr && tile?.pre && activeRef.current) {
               const t0 = performance.now();
-              paintRemote(fr, remotePreRef.current, remoteAreaRef.current);
+              paintRemote(fr, tile.pre, tile.area);
               governor.current.notePaint(performance.now() - t0);
             }
           });
+          remoteRafRef.current.set(peerId, rafId);
         }
       },
-      onRemoteHangup: () => {
-        remoteHereRef.current = false;
-        clearPre(remotePreRef.current);
-        setRemoteHere(false);
-        setPeerHungUp(true);
-        setCallStatus("closed");
+      onRemoteHangup: (peerId: string) => removeParticipant(peerId),
+      onRemoteStream: (peerId: string, s: MediaStream) => {
+        remoteStreamsRef.current.set(peerId, s);
+        const el = audioElsRef.current.get(peerId);
+        if (el) { el.srcObject = s; el.play().catch(() => {}); }
       },
-      onRemoteStream: (s: MediaStream) => {
-        if (audioRef.current) { audioRef.current.srcObject = s; audioRef.current.play().catch(() => {}); }
+      onRemoteState: (peerId: string, state: RemoteState) => {
+        setPeerUI(prev => ({ ...prev, [peerId]: { ...(prev[peerId] ?? DEFAULT_PEER_UI), muted: state.micMuted, camOff: state.camOff } }));
       },
-      onRemoteState: (state: RemoteState) => {
-        setRemoteMuted(state.micMuted);
-        setRemoteCamOff(state.camOff);
-      },
-      onQualityChange: (_level, step) => {
-        // Drives the actual capture/send resolution (see renderLoop) —
-        // previously only fps and the drop-above-this-size threshold
-        // responded to network conditions, so a congested link just sent
-        // large, slow frames (or dropped them) at a fixed resolution.
-        qualityScaleRef.current = step.resScale;
+      onQualityChange: (peerId, _level, step) => {
+        // Drives the actual capture/send resolution (see renderLoop) — the
+        // most constrained currently-connected peer governs it, same
+        // reasoning as the old single-peer version, just taking the min
+        // across everyone now instead of there only ever being one.
+        peerResScaleRef.current.set(peerId, step.resScale);
+        let min = 1;
+        for (const v of peerResScaleRef.current.values()) min = Math.min(min, v);
+        qualityScaleRef.current = min;
       },
       onIdChanged: (newId, oldId) => {
         myIdRef.current = newId;
         if (roomRef.current) apiUpdatePeerId(roomRef.current, oldId, newId).catch(() => {});
+      },
+      onRoomFull: () => {
+        setRoomFullMsg(true);
+        setTimeout(() => setRoomFullMsg(false), 3000);
       },
     });
     callRef.current = mgr;
@@ -798,9 +915,9 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
         if (show) {
           const t = performance.now();
-          paintCanvas(pre, localAreaRef.current, img, true, false, false);
+          paintCanvas(pre, localAreaElRef.current, img, true, false, false);
           governor.current.noteSelfPaint(performance.now() - t, t);
-          localAreaRef.current?.classList.remove("call-area-dark");
+          localAreaElRef.current?.classList.remove("call-area-dark");
         }
         if (mgr?.isConnected) {
           if (!(plan && mgr.sendVideoFrame(img.data, img.width, img.height))) {
@@ -819,9 +936,9 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         if (gov.lowLight) lowLight.current.process(img.data, img.width, img.height);
         if (show) {
           const t = performance.now();
-          paintCanvas(pre, localAreaRef.current, img, true, true, false);
+          paintCanvas(pre, localAreaElRef.current, img, true, true, false);
           governor.current.noteSelfPaint(performance.now() - t, t);
-          localAreaRef.current?.classList.remove("call-area-dark");
+          localAreaElRef.current?.classList.remove("call-area-dark");
         }
         if (mgr?.isConnected) mgr.sendAdaptiveFrame(img.data, img.width, img.height, true);
         produced = true;
@@ -852,7 +969,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
           if (q) {
             if (show) {
               const t = performance.now();
-              paintColorAscii(pre, localAreaRef.current, w, h, sorted, raw, q.palette, q.indices);
+              paintColorAscii(pre, localAreaElRef.current, w, h, sorted, raw, q.palette, q.indices);
               governor.current.noteSelfPaint(performance.now() - t, t);
             }
             produced = true;
@@ -865,7 +982,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
           if (w > 0 && h > 0) {
             if (show) {
               const t = performance.now();
-              paintText(pre, localAreaRef.current, result.html, w, h);
+              paintText(pre, localAreaElRef.current, result.html, w, h);
               governor.current.noteSelfPaint(performance.now() - t, t);
             }
             if (mgr?.isConnected) {
@@ -893,7 +1010,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     const id = requestAnimationFrame(() => {
       layoutEpoch++; // the panels were display:none — re-measure everything
       updateCallFontSize();
-      if (lastRemote.current && remotePreRef.current) paintRemote(lastRemote.current, remotePreRef.current, remoteAreaRef.current);
+      for (const [peerId, fr] of lastRemoteRef.current) {
+        const tile = remoteTilesRef.current.get(peerId);
+        if (tile?.pre) paintRemote(fr, tile.pre, tile.area);
+      }
     });
     return () => cancelAnimationFrame(id);
   }, [active, updateCallFontSize]);
@@ -1040,10 +1160,17 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       return;
     }
 
-    const hostId = await apiJoin(code, myIdRef.current);
-    if (hostId) {
-      callRef.current?.connectTo(hostId, streamRef.current);
-      roomRef.current = code;
+    // Every other peer already in the room (join order) — not just the first, so a 3rd/4th joiner reaches everyone.
+    const others = await apiJoin(code, myIdRef.current);
+    if (others && others.length) {
+      if (others.length > MAX_REMOTE_PEERS) {
+        // A race let the room fill up between us checking and us joining — leave it rather than connect to nobody.
+        await apiLeave(code, myIdRef.current).catch(() => {});
+        setConnectErr("This call is already full (4 people max).");
+      } else {
+        callRef.current?.connectToAll(others, streamRef.current);
+        roomRef.current = code;
+      }
     } else {
       setConnectErr("Couldn't find that call code. Check it and try again.");
     }
@@ -1059,10 +1186,18 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     streamRef.current = null;
     if (videoRef.current)  videoRef.current.srcObject = null;
     clearPre(localPreRef.current);
-    clearPre(remotePreRef.current);
-    remoteHereRef.current = false; lastRemote.current = null;
-    setScreen("home"); setCallStatus("idle"); setRemoteHere(false);
-    setPeerHungUp(false); setRemoteMuted(false); setRemoteCamOff(false);
+    for (const rafId of remoteRafRef.current.values()) cancelAnimationFrame(rafId);
+    remoteRafRef.current.clear();
+    pendingRemoteRef.current.clear();
+    lastRemoteRef.current.clear();
+    remoteTilesRef.current.clear();
+    audioElsRef.current.clear();
+    remoteStreamsRef.current.clear();
+    peerResScaleRef.current.clear();
+    participantsRef.current = [];
+    setParticipants([]); setPeerUI({});
+    setScreen("home"); setCallStatus("idle");
+    setPeerHungUp(false); setRoomFullMsg(false);
     setMode(null); setMyCode(""); setJoinVal(""); setFps(0); fpsT.current = [];
     setMuted(false); setCamOff(false);
     resetTemporalSmoothing();
@@ -1093,27 +1228,6 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
     navigator.clipboard.writeText(myCode).catch(() => {});
     setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
-
-  const onPipPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    e.currentTarget.setPointerCapture(e.pointerId);
-    pipDragRef.current = {
-      startX: e.clientX, startY: e.clientY,
-      origRight: pipPos.right, origBottom: pipPos.bottom,
-    };
-  };
-  const onPipPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = pipDragRef.current; if (!d) return;
-    const dx = e.clientX - d.startX, dy = e.clientY - d.startY;
-    const container = callScreenRef.current, pip = localAreaRef.current;
-    if (!container || !pip) return;
-    const cw = container.clientWidth, ch = container.clientHeight;
-    const pw = pip.offsetWidth,       ph = pip.offsetHeight;
-    setPipPos({
-      right:  Math.max(0, Math.min(cw - pw, d.origRight  - dx)),
-      bottom: Math.max(0, Math.min(ch - ph, d.origBottom - dy)),
-    });
-  };
-  const onPipPointerUp = () => { pipDragRef.current = null; };
 
   if (screen === "home") {
     // Arrived through an invite link: Join is the obvious action, so it gets the highlight and comes first.
@@ -1173,7 +1287,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       <div key="screen-waiting" className="call-waiting-screen">
         <audio ref={audioRef} autoPlay playsInline style={{ display: "none" }} />
         <video ref={videoRef} playsInline muted style={{ display: "none" }} />
-        <div className="call-wait-top" ref={localAreaRef}>
+        <div className="call-wait-top" ref={setLocalAreaEl}>
           <pre ref={localPreRef} className="ascii-output call-pre-fill" style={{ lineHeight: "1.1" }} />
           {camErr && <div className="call-cam-err">{camErr}</div>}
         </div>
@@ -1202,7 +1316,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       <div key="screen-waiting" className="call-waiting-screen">
         <audio ref={audioRef} autoPlay playsInline style={{ display: "none" }} />
         <video ref={videoRef} playsInline muted style={{ display: "none" }} />
-        <div className="call-wait-top" ref={localAreaRef}>
+        <div className="call-wait-top" ref={setLocalAreaEl}>
           <pre ref={localPreRef} className="ascii-output call-pre-fill" style={{ lineHeight: "1.1" }} />
           {camErr && <div className="call-cam-err">{camErr}</div>}
         </div>
@@ -1242,57 +1356,60 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       <audio ref={audioRef} autoPlay playsInline style={{ display: "none" }} />
       <video ref={videoRef} playsInline muted style={{ display: "none" }} />
 
-      <div className="call-panels-wa">
-        <div ref={remoteAreaRef} className="call-panel-wa-remote">
-          {callStatus === "reconnecting" && (
-            <div className="call-reconnect-banner">
-              <span className="call-btn-spinner" />Reconnecting…
-            </div>
-          )}
+      <div ref={remoteAreaRef} className="call-panels-wa">
+        {(callStatus === "reconnecting" || Object.values(peerUI).some(u => u.reconnecting)) && (
+          <div className="call-reconnect-banner">
+            <span className="call-btn-spinner" />Reconnecting…
+          </div>
+        )}
 
-          {peerHungUp ? (
-            <div className="call-peer-hung-up">
-              {IconEndCall}
-              <p>Peer ended the call</p>
-              <button className="call-cancel-btn" onClick={endCall}>{IconBack} Back</button>
-            </div>
-          ) : !remoteHere ? (
-            <div className="call-panel-waiting">
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.35 }}>
-                <circle cx="12" cy="12" r="10" strokeDasharray="4 2"/>
-                <circle cx="12" cy="8"  r="1.5" fill="currentColor"/>
-                <path d="M12 12v4"/>
-              </svg>
-              <p>Connecting to peer…</p>
-            </div>
-          ) : null}
+        {roomFullMsg && (
+          <div className="call-reconnect-banner call-room-full-banner">This call is full — 4 people max</div>
+        )}
 
-          <pre
-            ref={remotePreRef}
-            className="ascii-output call-pre-wa"
-            style={{ display: remoteHere && !peerHungUp ? undefined : "none" }}
+        {participants.length === 0 ? (
+          <>
+            {peerHungUp ? (
+              <div className="call-peer-hung-up">
+                {IconEndCall}
+                <p>Call ended</p>
+                <button className="call-cancel-btn" onClick={endCall}>{IconBack} Back</button>
+              </div>
+            ) : (
+              <div className="call-panel-waiting">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.35 }}>
+                  <circle cx="12" cy="12" r="10" strokeDasharray="4 2"/>
+                  <circle cx="12" cy="8"  r="1.5" fill="currentColor"/>
+                  <path d="M12 12v4"/>
+                </svg>
+                <p>Connecting to peer…</p>
+              </div>
+            )}
+            {/* Nobody's joined yet — a simple floating self-preview, same spot CallGrid's pip mode uses once someone has. */}
+            <div className="call-panel-wa-local" ref={setLocalAreaEl}>
+              {fps > 0 && <span className="call-pip-fps">{fps}fps</span>}
+              <pre ref={localPreRef} className="ascii-output call-pre-pip" />
+            </div>
+          </>
+        ) : (
+          <CallGrid
+            tiles={[
+              {
+                id: "self", isSelf: true, muted, camOff,
+                content: (
+                  <div className="call-tile-local-area" ref={setLocalAreaEl}>
+                    {fps > 0 && <span className="call-pip-fps">{fps}fps</span>}
+                    <pre ref={localPreRef} className="ascii-output call-pre-pip" />
+                  </div>
+                ),
+              },
+              ...participants.map((id): GridTile => ({
+                id, isSelf: false, muted: peerUI[id]?.muted, camOff: peerUI[id]?.camOff,
+                content: <RemoteTile peerId={id} registerPre={registerPre} registerArea={registerArea} registerAudio={registerAudio} />,
+              })),
+            ]}
           />
-
-          {remoteHere && (remoteMuted || remoteCamOff) && (
-            <span className="call-remote-badges">
-              {remoteMuted  && <span title="Peer muted">{IconMicOff}</span>}
-              {remoteCamOff && <span title="Camera off">{IconCamOff}</span>}
-            </span>
-          )}
-        </div>
-
-        <div
-          ref={localAreaRef}
-          className="call-panel-wa-local"
-          style={{ right: pipPos.right, bottom: pipPos.bottom, position: "absolute" }}
-          onPointerDown={onPipPointerDown}
-          onPointerMove={onPipPointerMove}
-          onPointerUp={onPipPointerUp}
-          onPointerCancel={onPipPointerUp}
-        >
-          {fps > 0 && <span className="call-pip-fps">{fps}fps</span>}
-          <pre ref={localPreRef} className="ascii-output call-pre-pip" />
-        </div>
+        )}
 
         {showSettings && (
           <div className="call-settings-overlay" onClick={() => setShowSettings(false)}>
