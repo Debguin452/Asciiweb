@@ -8,6 +8,7 @@ export interface GridTile {
   content: ReactNode;
   muted?: boolean;
   camOff?: boolean;
+  waiting?: boolean;
 }
 
 interface Props {
@@ -75,8 +76,9 @@ function Tile({ tile, onTap, large }: { tile: GridTile; onTap: () => void; large
       tabIndex={0}
     >
       {tile.content}
-      {(tile.muted || tile.camOff) && (
+      {(tile.muted || tile.camOff || tile.waiting) && (
         <span className="call-grid-badges">
+          {tile.waiting && <span title="No video received yet" className="call-grid-badge">waiting for video…</span>}
           {tile.muted  && <span title="Muted" className="call-grid-badge">mic off</span>}
           {tile.camOff && <span title="Camera off" className="call-grid-badge">cam off</span>}
         </span>

@@ -46,6 +46,7 @@ function fontSizeForGrid(el: HTMLElement | null, cols: number, rows: number): nu
 const lastHtml = new WeakMap<HTMLPreElement, string>();
 const cvMap  = new WeakMap<HTMLPreElement, HTMLCanvasElement>();
 const imgMap = new WeakMap<HTMLCanvasElement, ImageData>();
+const TILE_FIT = "cover";
 
 function overlayCanvas(pre: HTMLPreElement): HTMLCanvasElement {
   let cv = cvMap.get(pre);
@@ -107,12 +108,22 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
     const out = pixelated || !enhanceFrame ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
     if (out) cctx.putImageData(out, 0, 0);
   } else cctx.putImageData((pixelated || !enhanceFrame ? null : enhance(img.data, w, h)) ?? img, 0, 0);
-  const key = `${w}x${h}${square ? "s" : "c"}@${layoutEpoch}`;
+  if (square) {
+    if (cv.dataset.k !== "fill") {
+      cv.dataset.k = "fill";
+      cv.style.width = "100%";
+      cv.style.height = "100%";
+      cv.style.objectFit = TILE_FIT;
+    }
+    return;
+  }
+  const key = `${w}x${h}c@${layoutEpoch}`;
   if (cv.dataset.k !== key) {
     const r = area?.getBoundingClientRect();
     if (r && r.width && r.height) {
       cv.dataset.k = key;
-      const cw = square ? 1 : CHAR_W_RATIO, ch = square ? 1 : CHAR_H_RATIO;
+      cv.style.objectFit = "";
+      const cw = CHAR_W_RATIO, ch = CHAR_H_RATIO;
       const k = Math.min(r.width / (w * cw), r.height / (h * ch));
       cv.style.width  = Math.floor(w * cw * k) + "px";
       cv.style.height = Math.floor(h * ch * k) + "px";
@@ -534,10 +545,13 @@ function RemoteTile({ peerId, registerPre, registerArea, registerAudio }: {
   registerArea: (id: string, el: HTMLDivElement | null) => void;
   registerAudio: (id: string, el: HTMLAudioElement | null) => void;
 }) {
+  const areaRef  = useCallback((el: HTMLDivElement | null) => registerArea(peerId, el), [peerId, registerArea]);
+  const preRef   = useCallback((el: HTMLPreElement | null) => registerPre(peerId, el), [peerId, registerPre]);
+  const audioRef = useCallback((el: HTMLAudioElement | null) => registerAudio(peerId, el), [peerId, registerAudio]);
   return (
-    <div className="call-tile-area" ref={el => registerArea(peerId, el)}>
-      <pre ref={el => registerPre(peerId, el)} className="ascii-output call-pre-wa" />
-      <audio ref={el => registerAudio(peerId, el)} autoPlay playsInline style={{ display: "none" }} />
+    <div className="call-tile-area" ref={areaRef}>
+      <pre ref={preRef} className="ascii-output call-pre-wa" />
+      <audio ref={audioRef} autoPlay playsInline style={{ display: "none" }} />
     </div>
   );
 }
@@ -1404,7 +1418,7 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
                 ),
               },
               ...participants.map((id): GridTile => ({
-                id, isSelf: false, muted: peerUI[id]?.muted, camOff: peerUI[id]?.camOff,
+                id, isSelf: false, muted: peerUI[id]?.muted, camOff: peerUI[id]?.camOff, waiting: !peerUI[id]?.hasFrame && !peerUI[id]?.camOff,
                 content: <RemoteTile peerId={id} registerPre={registerPre} registerArea={registerArea} registerAudio={registerAudio} />,
               })),
             ]}
