@@ -322,9 +322,10 @@ class PeerSession {
   }
 
   private attachMedia(call: MediaConnection) {
-    call.on("stream", s => this.events.onRemoteStream(s));
-    call.on("close", () => this.events.onRemoteHangup());
-    call.on("error", () => { this.mediaConn = null; });
+    const current = () => !this.destroyed && this.mediaConn === call;
+    call.on("stream", s => { if (current()) this.events.onRemoteStream(s); });
+    call.on("close", () => { if (current()) this.events.onRemoteHangup(); });
+    call.on("error", () => { if (current()) this.mediaConn = null; });
     call.on("iceStateChanged", state => {
       if (state === "failed") {
         try { call.close(); } catch { /* noop */ }
@@ -336,6 +337,7 @@ class PeerSession {
     this.dataConn = conn;
 
     conn.on("open", () => {
+      if (this.dataConn !== conn) return;
       this.reconnectAttempts = 0;
       this.events.onStatus("connected");
       this.receivedKeyframe = false;
@@ -349,6 +351,7 @@ class PeerSession {
     });
 
     conn.on("data", (data: unknown) => {
+      if (this.dataConn !== conn) return;
       this.lastRecvAt = performance.now();
 
       if (data && typeof data === "object" && "type" in (data as Record<string, unknown>) && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
@@ -390,7 +393,7 @@ class PeerSession {
     });
 
     conn.on("iceStateChanged", state => {
-      if (this.destroyed) return;
+      if (this.destroyed || this.dataConn !== conn) return;
       if (state === "disconnected") {
         this.events.onStatus("reconnecting");
       } else if (state === "failed") {
@@ -402,10 +405,12 @@ class PeerSession {
     });
 
     conn.on("close", () => {
+      if (this.dataConn !== conn) return;
       this.stopHeartbeat();
       if (!this.destroyed) this.events.onStatus("closed");
     });
     conn.on("error", err => {
+      if (this.dataConn !== conn) return;
       this.stopHeartbeat();
       this.events.onStatus("error", err.message);
     });
