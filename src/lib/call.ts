@@ -85,6 +85,11 @@ function audioOnly(stream: MediaStream): MediaStream {
 const RECONNECT_DELAY = 1500;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+/** Group-call cap: this many *other* participants, plus yourself, so a call tops out at 4 people total. Mesh (everyone connects
+ *  to everyone, no media server) is fine at this size on a phone CPU/battery; much beyond it the per-peer encode cost (every
+ *  frame is quantized/encoded once per remote participant — see CallManager.broadcast below) stops being worth it. */
+export const MAX_REMOTE_PEERS = 3;
+
 export type CallQualityLevel = "low" | "medium" | "high" | "ultra" | "max";
 
 export interface CallQualityStep {
@@ -116,17 +121,6 @@ const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra", "ma
 const BUFFERED_AMOUNT_LOW_THRESHOLD = 96 * 1024;
 const BUFFERED_AMOUNT_CRITICAL = 1024 * 1024;
 
-
-export interface CallManagerEvents {
-  onStatus: (status: CallStatus, detail?: string) => void;
-  onRemoteFrame: (frame: RemoteFrame) => void;
-  onRemoteHangup: () => void;
-  onRemoteStream: (stream: MediaStream) => void;
-  onRemoteState?: (state: RemoteState) => void;
-  onQualityChange?: (level: CallQualityLevel, step: CallQualityStep) => void;
-  onIdChanged?: (newId: string, oldId: string) => void;
-}
-
 export type CallStatus = "idle" | "waiting" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
 
 export interface RemoteState {
@@ -134,17 +128,46 @@ export interface RemoteState {
   camOff: boolean;
 }
 
-export class CallManager {
-  private peer: Peer | null = null;
+/** Every callback now carries which remote participant it's about — the one thing that's new versus the old single-peer shape. */
+export interface CallManagerEvents {
+  onStatus: (peerId: string, status: CallStatus, detail?: string) => void;
+  onRemoteFrame: (peerId: string, frame: RemoteFrame) => void;
+  onRemoteHangup: (peerId: string) => void;
+  onRemoteStream: (peerId: string, stream: MediaStream) => void;
+  onRemoteState?: (peerId: string, state: RemoteState) => void;
+  onQualityChange?: (peerId: string, level: CallQualityLevel, step: CallQualityStep) => void;
+  onIdChanged?: (newId: string, oldId: string) => void;
+  /** A 4th participant tried to join while the call was already full — nobody was connected to. */
+  onRoomFull?: (peerId: string) => void;
+}
+
+interface SessionEvents {
+  onStatus: (status: CallStatus, detail?: string) => void;
+  onRemoteFrame: (frame: RemoteFrame) => void;
+  onRemoteHangup: () => void;
+  onRemoteStream: (stream: MediaStream) => void;
+  onRemoteState: (state: RemoteState) => void;
+  onQualityChange: (level: CallQualityLevel, step: CallQualityStep) => void;
+  /** Our own outgoing leg to this peer died and the peer is still around — ask CallManager to redial it (see rejoin() below). */
+  onNeedRedial: () => void;
+}
+
+/**
+ * Everything the old single-peer `CallManager` tracked per-connection — codec state, quality ramping, RTT, heartbeat,
+ * reconnect — now scoped to exactly one remote participant, so a group call is just several of these running side by side.
+ * Each session encodes and quantizes independently: with no media server, there is no way to send one encoded frame to
+ * three different peers, so the CPU cost of Color/Pixel mode scales with participant count. That's the real ceiling
+ * MAX_REMOTE_PEERS is protecting.
+ */
+class PeerSession {
+  readonly peerId: string;
+  private isHost: boolean;
+  private events: SessionEvents;
+
   private dataConn: DataConnection | null = null;
   private mediaConn: MediaConnection | null = null;
-  private events: CallManagerEvents;
-  private localStream: MediaStream | null = null;
   private pendingIncomingCall: MediaConnection | null = null;
 
-  private myId = "";
-  private remoteId: string | null = null;
-  private isHost = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
@@ -158,8 +181,6 @@ export class CallManager {
   // ── WebCodecs video (Color mode). Used only when BOTH peers can handle a common codec; otherwise the quadtree codec runs.
   private videoTx = new VideoSender();
   private videoRx = new VideoReceiver();
-  private encCodecs: VideoCodecId[] = [];            // what this browser can encode (probed once)
-  private encProbe: Promise<void> | null = null;
   private remoteDec: VideoCodecId[] | null = null;   // what the peer told us it can decode (null = not yet)
   private videoDisabled = false;                     // an error or the peer's "nowc" switched us back to the quadtree codec
   private curChars = new Uint8Array(0); // reused per-frame scratch (no per-frame allocations on the hot path)
@@ -172,17 +193,6 @@ export class CallManager {
   private rttSamples: number[] = [];
   private consecutiveDrops = 0;
   private frameCount = 0;
-  // Starting at "ultra" (48fps, full resolution, the biggest frames) meant
-  // every call began by blasting the most demanding setting a phone's
-  // single-threaded JS + data channel could possibly sustain, before any
-  // congestion signal existed to say otherwise. That's backwards — it
-  // guarantees an overload spike (dropped/late frames, CPU-starved
-  // encoding) right at connect, which is also exactly when adaptQuality()
-  // has the least data (consecutiveGood/Bad both start at 0) to react
-  // quickly. Starting at "medium" and letting adaptQuality() ramp UP once
-  // conditions are confirmed good (2 consecutive healthy checks) is far
-  // more stable than starting high and only reacting after things are
-  // already struggling.
   private keyframeInterval = QUALITY_STEPS.medium.keyframeInterval;
   private lastSentAt = 0;
   private targetFps = QUALITY_STEPS.medium.targetFps;
@@ -198,21 +208,20 @@ export class CallManager {
   private consecutiveBad = 0;
   private readonly CHECK_FRAMES = 15;
 
-  // iceStateChanged only fires when the browser itself notices the
-  // RTCPeerConnection changed state (failed/disconnected). It does NOT
-  // cover the common "silent hang" case: a NAT rebinding, a backgrounded
-  // tab whose radio drops the link, or a corporate firewall that starts
-  // quietly dropping UDP packets mid-call — the connection can keep
-  // reporting "connected" while literally nothing gets through. A small
-  // heartbeat (sent even when the camera is off and no real frames are
-  // flowing) plus a last-received-anything timestamp lets us detect that
-  // case ourselves instead of hanging forever with a "connected" UI.
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastRecvAt = 0;
   private readonly HEARTBEAT_INTERVAL = 1000;
   private readonly STALE_TIMEOUT = 9000;
 
-  constructor(events: CallManagerEvents) {
+  private fpsCap = 60;
+
+  // Shared across sessions (probed once by CallManager) — what THIS browser can encode.
+  private encCodecs: VideoCodecId[];
+
+  constructor(peerId: string, isHost: boolean, encCodecs: VideoCodecId[], events: SessionEvents) {
+    this.peerId = peerId;
+    this.isHost = isHost;
+    this.encCodecs = encCodecs;
     this.events = events;
     this.videoTx.onPacket = (buf, key) => this.dispatchVideo(buf, key);
     this.videoTx.onFailure = () => { this.videoDisabled = true; this.needKeyframe = true; };
@@ -226,122 +235,35 @@ export class CallManager {
     };
     this.videoRx.onNeedKey = () => this.requestKeyframe();
     this.videoRx.onUnsupported = () => { try { this.dataConn?.send({ type: "nowc" }); } catch { /* noop */ } };
-    if (webCodecsAvailable()) this.encProbe = probeEncoders().then(c => { this.encCodecs = c; }).catch(() => {});
   }
 
-  async start(): Promise<string> {
-    this.destroyed = false;
-    const iceServers = await fetchIceServers();
-    if (this.destroyed) throw new Error("destroyed");
-    return new Promise((resolve, reject) => {
-      const peer = new Peer({ config: { iceServers }, debug: 1 });
-      this.peer = peer;
-
-      const timeout = setTimeout(() => reject(new Error("Signaling timeout")), 10000);
-
-      peer.on("open", id => {
-        clearTimeout(timeout);
-        this.myId = id;
-        this.events.onStatus("waiting", id);
-        resolve(id);
-      });
-
-      peer.on("connection", conn => {
-        this.isHost = true;
-        this.remoteId = conn.peer;
-        this.attachData(conn);
-      });
-
-      peer.on("call", call => {
-        this.mediaConn = call;
-        this.remoteId = call.peer;
-        this.isHost = true;
-        this.attachMedia(call);
-        if (this.localStream) {
-          call.answer(audioOnly(this.localStream));
-        } else {
-          this.pendingIncomingCall = call;
-        }
-      });
-
-      peer.on("disconnected", () => {
-        if (this.destroyed) return;
-        this.events.onStatus("reconnecting");
-        try { peer.reconnect(); } catch { /* noop */ }
-      });
-
-      peer.on("error", err => {
-        clearTimeout(timeout);
-        if (this.peer === peer && !this.destroyed) {
-          this.handlePeerError(err);
-        }
-        reject(err);
-      });
-
-      peer.on("close", () => {
-        if (!this.destroyed) this.events.onStatus("error", "Signaling closed");
-      });
-    });
-  }
-
-  private handlePeerError(err: { type?: string; message?: string }) {
-    const recoverable = err.type === "network" || err.type === "server-error" || err.type === "socket-error" || err.type === "socket-closed";
-    if (recoverable && this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      this.reconnectAttempts++;
-      this.events.onStatus("reconnecting", err.message);
-      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = setTimeout(() => {
-        if (!this.destroyed) this.rejoin();
-      }, RECONNECT_DELAY * this.reconnectAttempts);
-    } else {
-      this.events.onStatus("error", err.message ?? "Connection error");
+  connect(peer: Peer, stream: MediaStream | null) {
+    this.isHost = false;
+    this.events.onStatus("connecting", this.peerId);
+    const conn = peer.connect(this.peerId, { reliable: true, serialization: "binary" });
+    this.attachData(conn);
+    if (stream) {
+      const call = peer.call(this.peerId, audioOnly(stream));
+      this.mediaConn = call;
+      this.attachMedia(call);
     }
   }
 
-  private rejoin() {
-    if (!this.peer || this.peer.destroyed) {
-      const oldId = this.myId;
-      this.start().then(newId => {
-        if (newId !== oldId) this.events.onIdChanged?.(newId, oldId);
-        if (this.remoteId) this.connectTo(this.remoteId, this.localStream);
-      }).catch(() => { /* surfaced via onStatus already */ });
-      return;
-    }
-    if (this.remoteId && !this.isHost) {
-      try { this.dataConn?.close(); }  catch { /* noop */ }
-      try { this.mediaConn?.close(); } catch { /* noop */ }
-      this.dataConn  = null;
-      this.mediaConn = null;
-      this.connectTo(this.remoteId, this.localStream);
-    }
+  /** The host side answers an incoming media call once a local stream exists (it may not yet, if the camera is still starting). */
+  attachIncomingCall(call: MediaConnection, stream: MediaStream | null) {
+    this.mediaConn = call;
+    this.attachMedia(call);
+    if (stream) call.answer(audioOnly(stream));
+    else this.pendingIncomingCall = call;
   }
 
   answerWithStream(stream: MediaStream) {
-    this.localStream = stream;
     if (this.pendingIncomingCall) {
       const call = this.pendingIncomingCall;
       this.pendingIncomingCall = null;
       call.answer(audioOnly(stream));
     } else if (this.mediaConn && this.mediaConn.open === false) {
       this.mediaConn.answer(audioOnly(stream));
-    }
-  }
-
-  connectTo(remoteId: string, stream: MediaStream | null) {
-    if (!this.peer) return;
-    const id = remoteId.trim();
-    this.isHost = false;
-    this.remoteId = id;
-    this.events.onStatus("connecting", id);
-    this.localStream = stream;
-
-    const conn = this.peer.connect(id, { reliable: true, serialization: "binary" });
-    this.attachData(conn);
-
-    if (stream) {
-      const call = this.peer.call(id, audioOnly(stream));
-      this.mediaConn = call;
-      this.attachMedia(call);
     }
   }
 
@@ -365,8 +287,6 @@ export class CallManager {
     const idx = QUALITY_ORDER.indexOf(this.qualityLevel);
     if (idx === -1) return;
 
-    // RTT rides the same ordered channel as the frames, so it includes our own send-queue delay — a real congestion signal,
-    // unlike timing a synchronous send() (which is always ~0).
     const rttKnown = this.rtt > 0;
     const congested = buffered > BUFFERED_AMOUNT_LOW_THRESHOLD || dropRate > 0.2 || (rttKnown && this.rtt > this.rttBase * 2.5 + 120);
     const healthy   = buffered < 16 * 1024 && dropRate < 0.05 && (!rttKnown || this.rtt < this.rttBase * 1.7 + 60);
@@ -398,15 +318,13 @@ export class CallManager {
     this.keyframeInterval = step.keyframeInterval;
     this.targetFps        = step.targetFps;
     this.maxFrameSize      = step.maxFrameSize;
-    this.events.onQualityChange?.(level, step);
+    this.events.onQualityChange(level, step);
   }
 
   private attachMedia(call: MediaConnection) {
     call.on("stream", s => this.events.onRemoteStream(s));
     call.on("close", () => this.events.onRemoteHangup());
-    call.on("error", () => {
-      this.mediaConn = null;
-    });
+    call.on("error", () => { this.mediaConn = null; });
     call.on("iceStateChanged", state => {
       if (state === "failed") {
         try { call.close(); } catch { /* noop */ }
@@ -414,7 +332,7 @@ export class CallManager {
     });
   }
 
-  private attachData(conn: DataConnection) {
+  attachData(conn: DataConnection) {
     this.dataConn = conn;
 
     conn.on("open", () => {
@@ -426,7 +344,7 @@ export class CallManager {
       this.videoRx.reset(); this.videoTx.reset();
       this.remoteDec = null; this.videoDisabled = false;
       probeDecoders().then(dec => { try { conn.send({ type: "caps", dec }); } catch { /* noop */ } }).catch(() => {});
-      this.lastRecvAt       = performance.now();
+      this.lastRecvAt = performance.now();
       this.startHeartbeat();
     });
 
@@ -439,23 +357,19 @@ export class CallManager {
         if (m.type === "pong") { if (typeof m.t === "number") this.onRtt(performance.now() - m.t); return; }
         if (m.type === "kf") { this.needKeyframe = true; return; }
         if (m.type === "caps") { this.remoteDec = Array.isArray(m.dec) ? (m.dec.filter(n => n === 0 || n === 1 || n === 2) as VideoCodecId[]) : []; return; }
-        if (m.type === "nowc") { this.videoDisabled = true; this.needKeyframe = true; return; } // the peer can't show video packets after all
-        if (m.type === "state") {
-          this.events.onRemoteState?.({ micMuted: !!m.micMuted, camOff: !!m.camOff });
-          return;
-        }
+        if (m.type === "nowc") { this.videoDisabled = true; this.needKeyframe = true; return; }
+        if (m.type === "state") { this.events.onRemoteState({ micMuted: !!m.micMuted, camOff: !!m.camOff }); return; }
         return;
       }
 
       const buf = toArrayBuffer(data);
       const b0 = buf && buf.byteLength > 0 ? new Uint8Array(buf, 0, 1)[0] : 0;
       if (buf && (b0 & VIDEO_PACKET_MASK) === VIDEO_PACKET_MASK) {
-        this.videoRx.push(new Uint8Array(buf)); // real-video Color frame (decoded asynchronously, delivered via videoRx.onFrame)
+        this.videoRx.push(new Uint8Array(buf));
       } else if (buf && (b0 & ADAPTIVE_FLAG)) {
-        // Adaptive-detail Color frame
         const image = this.adaptDec.decode(new Uint8Array(buf));
         if (image) {
-          this.prevRecvFrame = null; // legacy delta bases don't carry over; the sender keyframes on every mode change
+          this.prevRecvFrame = null;
           this.events.onRemoteFrame({
             w: image.width, h: image.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
             isKeyframe: false, isBlockColor: false, isPixelated: this.adaptDec.lastPixelated, image, timestamp: performance.now(),
@@ -480,16 +394,7 @@ export class CallManager {
       if (state === "disconnected") {
         this.events.onStatus("reconnecting");
       } else if (state === "failed") {
-        if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          this.reconnectAttempts++;
-          this.events.onStatus("reconnecting");
-          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-          this.reconnectTimer = setTimeout(() => {
-            if (!this.destroyed) this.rejoin();
-          }, RECONNECT_DELAY);
-        } else {
-          this.events.onStatus("error", "Connection lost");
-        }
+        this.tryRedial();
       } else if (state === "connected" || state === "completed") {
         this.reconnectAttempts = 0;
         if (this.dataConn?.open) this.events.onStatus("connected");
@@ -506,31 +411,33 @@ export class CallManager {
     });
   }
 
+  /** Only the side that originally dialed out redials on failure — matches the pre-group-calls behavior, and avoids both
+   *  sides racing to reconnect to each other at once. */
+  private tryRedial() {
+    if (this.isHost) return; // we didn't dial this peer; wait for them to redial us
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.events.onStatus("error", "Connection lost");
+      return;
+    }
+    this.reconnectAttempts++;
+    this.events.onStatus("reconnecting");
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      if (!this.destroyed) this.events.onNeedRedial();
+    }, RECONNECT_DELAY);
+  }
+
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this.dataConn?.open) return;
-      try { this.dataConn.send({ type: "ping", t: performance.now() }); } catch { /* noop — next tick or iceStateChanged will catch a truly dead channel */ }
+      try { this.dataConn.send({ type: "ping", t: performance.now() }); } catch { /* noop */ }
 
       const now = performance.now();
       if (now - this.lastRecvAt > this.STALE_TIMEOUT) {
-        // Nothing — not a video frame, a state update, nor the peer's own
-        // ping — has come through in STALE_TIMEOUT ms, despite the data
-        // channel reporting itself open. Treat this the same way a
-        // "failed" iceStateChanged is treated: reconnect if we still have
-        // attempts left, otherwise surface it as a lost connection.
-        this.lastRecvAt = now; // reset so we don't refire every tick while rejoin() works
+        this.lastRecvAt = now;
         if (this.destroyed) return;
-        if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          this.reconnectAttempts++;
-          this.events.onStatus("reconnecting");
-          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-          this.reconnectTimer = setTimeout(() => {
-            if (!this.destroyed) this.rejoin();
-          }, RECONNECT_DELAY);
-        } else {
-          this.events.onStatus("error", "Connection lost");
-        }
+        this.tryRedial();
       }
     }, this.HEARTBEAT_INTERVAL);
   }
@@ -539,15 +446,13 @@ export class CallManager {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
-  private fpsCap = 60;
   setFpsCap(cap: number) { this.fpsCap = Math.max(5, cap); }
   get currentFps() { return Math.min(this.targetFps, this.fpsCap); }
 
-  /** True when a new frame should be produced now. Callers check this BEFORE doing capture/convert work, so no CPU is spent on frames that would be throttled away. */
   isSendDue(): boolean {
     if (!this.dataConn?.open) return false;
     const now = performance.now();
-    if (this.lastSentAt > 0 && now - this.lastSentAt < 1000 / Math.min(this.targetFps, this.fpsCap) - 2) return false;
+    if (this.lastSentAt > 0 && now - this.lastSentAt < 1000 / this.currentFps - 2) return false;
     return (this.dataConn?.dataChannel?.bufferedAmount ?? 0) <= BUFFERED_AMOUNT_CRITICAL;
   }
 
@@ -558,14 +463,12 @@ export class CallManager {
     return dst;
   }
 
-  /** True (once per change) when the stream switched between ascii / colored ascii / pixel — the receiver needs a self-contained keyframe. */
   private kindChanged(kind: number): boolean {
     const changed = this.lastKind !== kind;
     this.lastKind = kind;
     return changed;
   }
 
-  /** Plain ASCII mode — sends character indices only. */
   sendAsciiFrame(charIndices: ArrayLike<number>, w: number, h: number, charset: string) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
@@ -585,11 +488,6 @@ export class CallManager {
     this.dispatch(buf, chars, null, forceKeyframe);
   }
 
-  /**
-   * Colored ASCII mode — character indices plus an adaptive 256-color palette index per cell.
-   * `rgba` is w*h*4 (already brightness-lifted, see fillLiftedRgba). Returns what was actually sent
-   * (so the local preview shows exactly what the peer sees), or null if the frame was throttled.
-   */
   sendAsciiColorFrame(
     charIndices: ArrayLike<number>, w: number, h: number, charset: string,
     rgba: Uint8ClampedArray | Uint8Array
@@ -602,7 +500,7 @@ export class CallManager {
     let forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(2) || this.prevSentColorIdx?.length !== N || this.prevSentIndices?.length !== N;
     const chars = this.scratchChars(charIndices, N);
     const q = this.quant.quantize(rgba, N, forceKeyframe, forceKeyframe ? null : this.prevSentColorIdx);
-    if (q.rebuilt) forceKeyframe = true; // new palette ⇒ everything must be re-sent against it
+    if (q.rebuilt) forceKeyframe = true;
 
     const buf = encodeFrame({
       w, h, charset, colorIndices: q.indices, palette: q.palette, sendPalette: forceKeyframe,
@@ -616,11 +514,9 @@ export class CallManager {
   }
 
   private shouldForceKeyframe(): boolean {
-    const force = this.needKeyframe || this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
-    return force;
+    return this.needKeyframe || this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
   }
 
-  /** Color / Pixel (color-block) modes — send only color data; `pixelated` tells the peer to draw them as solid █ character cells (Pixel mode). Returns what was sent, for the local preview. rgba is w*h*4 RGBA bytes (alpha ignored). */
   sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false): { palette: Uint8Array; indices: Uint8Array } | null {
     if (!this.dataConn?.open) return null;
     if (!this.throttle()) return null;
@@ -641,11 +537,6 @@ export class CallManager {
     return { palette: q.palette, indices: q.indices };
   }
 
-  /**
-   * Color mode — adaptive-detail video. `rgba` is a square-pixel w×h image (both multiples of 8). Detail is spent where the
-   * picture has it; the packet is sized to this quality tier's frame budget, so the network scaler works through the budget
-   * rather than by shrinking the whole frame.
-   */
   sendAdaptiveFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixel = false) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
@@ -656,42 +547,35 @@ export class CallManager {
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
-  /** The codec both peers can use for real-video Color mode, or null (→ use the quadtree codec). */
-  private get videoCodec(): VideoCodecId | null {
+  /** The codec both sides of THIS session can use for real-video Color mode, or null (→ quadtree codec for this peer). */
+  get videoCodec(): VideoCodecId | null {
     if (this.videoDisabled || !this.remoteDec || !this.videoTx.usable) return null;
     for (const id of VIDEO_CODEC_PREFERENCE) if (this.encCodecs.includes(id) && this.remoteDec.includes(id)) return id;
     return null;
   }
 
-  /** Capture size for real-video Color mode at the current quality tier, or null when it isn't available. */
   videoPlan(vw: number, vh: number, scale = 1): { w: number; h: number } | null {
     if (this.videoCodec === null || !this.dataConn?.open) return null;
     return videoDims(vw, vh, Math.max(96, Math.round(VIDEO_TIERS[this.qualityLevel].long * scale / 16) * 16));
   }
 
-  /**
-   * Real-video Color mode (WebCodecs). `rgba` is a w×h frame at the size from videoPlan(). Returns false only when video isn't
-   * usable (caller should use the quadtree codec); a frame skipped for pacing/backlog still counts as handled.
-   */
   sendVideoFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number): boolean {
     const codec = this.videoCodec;
     if (codec === null || !this.dataConn?.open) return false;
     if (!this.throttle()) return true;
 
     this.frameCount++;
-    // Keyframes are costly with real video, so the periodic one is far rarer than for the still-image codecs (peers ask for one if they lose sync).
     const forceKey = this.needKeyframe || this.kindChanged(7) || this.frameCount === 1 || this.frameCount % 150 === 1;
     const tier = VIDEO_TIERS[this.qualityLevel];
     if (this.videoTx.encode(rgba, w, h, codec, tier.bitrate, this.targetFps, forceKey) && forceKey) this.needKeyframe = false;
     return true;
   }
 
-  /** Encoded video packets leave here (asynchronously). Never size-gated: dropping a delta frame would corrupt everything after it. */
   private dispatchVideo(buf: ArrayBuffer, key: boolean) {
     if (!this.dataConn?.open) return;
     const buffered = this.dataConn.dataChannel?.bufferedAmount ?? 0;
     if (buffered > BUFFERED_AMOUNT_CRITICAL) {
-      this.recentDrops++; this.needKeyframe = true; // chain broken → restart it with a keyframe
+      this.recentDrops++; this.needKeyframe = true;
     } else {
       this.recentSends++;
       try {
@@ -706,7 +590,7 @@ export class CallManager {
 
   private throttle(): boolean {
     const now = performance.now();
-    const minInterval = 1000 / this.currentFps - 2; // same slack as isSendDue(), so a frame we already paid to produce isn't dropped here
+    const minInterval = 1000 / this.currentFps - 2;
     if (this.lastSentAt > 0 && now - this.lastSentAt < minInterval) return false;
 
     const buffered = this.dataConn?.dataChannel?.bufferedAmount ?? 0;
@@ -716,7 +600,6 @@ export class CallManager {
     return true;
   }
 
-  /** Copies `src` into `slot` (reallocating only when the size changed) — the delta base must be a stable snapshot. */
   private keep(slot: Uint8Array | null, src: Uint8Array): Uint8Array {
     if (!slot || slot.length !== src.length) return new Uint8Array(src);
     slot.set(src);
@@ -738,14 +621,13 @@ export class CallManager {
 
     try {
       this.dataConn.send(buf);
-
       this.prevSentIndices   = charIndices ? this.keep(this.prevSentIndices, charIndices) : null;
       this.prevSentColorIdx  = colorIndices ? this.keep(this.prevSentColorIdx, colorIndices) : null;
       this.consecutiveDrops = 0;
       if (forceKeyframe) { this.needKeyframe = false; this.framesSinceKey = 0; } else this.framesSinceKey++;
     } catch {
       this.recentDrops++;
-      this.needKeyframe = true; // sender/receiver bases may now disagree — resync with a full frame
+      this.needKeyframe = true;
     }
 
     this.qualityCheckCounter++;
@@ -766,37 +648,295 @@ export class CallManager {
     this.destroyed = true;
     this.stopHeartbeat();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    this.reconnectAttempts = 0;
-    this.remoteId = null;
     this.pendingIncomingCall = null;
-    this.prevSentIndices = null;
-    this.prevSentColorIdx = null;
-    this.prevRecvFrame = null;
     this.adaptEnc.reset(); this.adaptDec.reset();
-    this.videoTx.reset(); this.videoRx.reset(); this.remoteDec = null; this.videoDisabled = false;
-    this.lastKind = 0;
-    this.frameCount = 0;
+    this.videoTx.reset(); this.videoRx.reset();
     try { this.dataConn?.close(); }  catch { /* noop */ }
     try { this.mediaConn?.close(); } catch { /* noop */ }
-    try { this.peer?.destroy(); }    catch { /* noop */ }
     this.dataConn  = null;
     this.mediaConn = null;
-    this.peer      = null;
   }
 
-  setTargetFps(fps: number) { this.targetFps = Math.max(5, Math.min(60, fps)); }
   getQualityLevel(): CallQualityLevel { return this.qualityLevel; }
-  getMyId(): string { return this.myId; }
-
   getStats() {
+    return { quality: this.qualityLevel, fps: this.targetFps, keyframeInterval: this.keyframeInterval, latency: Math.round(this.rtt), drops: this.recentDrops };
+  }
+  get isConnected() { return !!this.dataConn?.open; }
+}
+
+/**
+ * Owns the one shared signaling `Peer` plus one `PeerSession` per remote participant (mesh: everyone connects directly to
+ * everyone, capped at MAX_REMOTE_PEERS, no media server). All the old single-peer behavior still lives in PeerSession
+ * unchanged — this class is just the part that's actually new: deciding *which* session a piece of work belongs to, and
+ * fanning frame-sends out to all of them.
+ */
+export class CallManager {
+  private peer: Peer | null = null;
+  private sessions = new Map<string, PeerSession>();
+  private events: CallManagerEvents;
+  private localStream: MediaStream | null = null;
+
+  private myId = "";
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private destroyed = false;
+
+  private encCodecs: VideoCodecId[] = [];
+  private encProbe: Promise<void> | null = null;
+
+  constructor(events: CallManagerEvents) {
+    this.events = events;
+    if (webCodecsAvailable()) this.encProbe = probeEncoders().then(c => { this.encCodecs = c; }).catch(() => {});
+  }
+
+  private sessionEvents(peerId: string): SessionEvents {
     return {
-      quality: this.qualityLevel,
-      fps: this.targetFps,
-      keyframeInterval: this.keyframeInterval,
-      latency: Math.round(this.rtt),
-      drops: this.recentDrops,
+      onStatus: (s, d) => this.events.onStatus(peerId, s, d),
+      onRemoteFrame: f => this.events.onRemoteFrame(peerId, f),
+      onRemoteHangup: () => { this.events.onRemoteHangup(peerId); this.sessions.delete(peerId); },
+      onRemoteStream: s => this.events.onRemoteStream(peerId, s),
+      onRemoteState: s => this.events.onRemoteState?.(peerId, s),
+      onQualityChange: (lvl, step) => this.events.onQualityChange?.(peerId, lvl, step),
+      onNeedRedial: () => {
+        if (this.destroyed || !this.peer) return;
+        const session = this.sessions.get(peerId);
+        if (!session) return;
+        session.hangup();
+        const fresh = new PeerSession(peerId, false, this.encCodecs, this.sessionEvents(peerId));
+        this.sessions.set(peerId, fresh);
+        fresh.connect(this.peer, this.localStream);
+      },
     };
   }
 
-  get isConnected() { return !!this.dataConn?.open; }
+  private createSession(peerId: string, isHost: boolean): PeerSession {
+    const session = new PeerSession(peerId, isHost, this.encCodecs, this.sessionEvents(peerId));
+    this.sessions.set(peerId, session);
+    return session;
+  }
+
+  async start(): Promise<string> {
+    this.destroyed = false;
+    const iceServers = await fetchIceServers();
+    if (this.destroyed) throw new Error("destroyed");
+    return new Promise((resolve, reject) => {
+      const peer = new Peer({ config: { iceServers }, debug: 1 });
+      this.peer = peer;
+
+      const timeout = setTimeout(() => reject(new Error("Signaling timeout")), 10000);
+
+      peer.on("open", id => {
+        clearTimeout(timeout);
+        this.myId = id;
+        this.events.onStatus("", "waiting", id);
+        resolve(id);
+      });
+
+      peer.on("connection", conn => {
+        const remoteId = conn.peer;
+        if (!this.sessions.has(remoteId) && this.sessions.size >= MAX_REMOTE_PEERS) {
+          this.events.onRoomFull?.(remoteId);
+          try { conn.close(); } catch { /* noop */ }
+          return;
+        }
+        const session = this.sessions.get(remoteId) ?? this.createSession(remoteId, true);
+        session.attachData(conn);
+      });
+
+      peer.on("call", call => {
+        const remoteId = call.peer;
+        if (!this.sessions.has(remoteId) && this.sessions.size >= MAX_REMOTE_PEERS) {
+          this.events.onRoomFull?.(remoteId);
+          try { call.close(); } catch { /* noop */ }
+          return;
+        }
+        const session = this.sessions.get(remoteId) ?? this.createSession(remoteId, true);
+        session.attachIncomingCall(call, this.localStream);
+      });
+
+      peer.on("disconnected", () => {
+        if (this.destroyed) return;
+        this.events.onStatus("", "reconnecting");
+        try { peer.reconnect(); } catch { /* noop */ }
+      });
+
+      peer.on("error", err => {
+        clearTimeout(timeout);
+        if (this.peer === peer && !this.destroyed) {
+          this.handlePeerError(err);
+        }
+        reject(err);
+      });
+
+      peer.on("close", () => {
+        if (!this.destroyed) this.events.onStatus("", "error", "Signaling closed");
+      });
+    });
+  }
+
+  private handlePeerError(err: { type?: string; message?: string }) {
+    const recoverable = err.type === "network" || err.type === "server-error" || err.type === "socket-error" || err.type === "socket-closed";
+    if (recoverable && this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      this.reconnectAttempts++;
+      this.events.onStatus("", "reconnecting", err.message);
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => {
+        if (!this.destroyed) this.rejoinSignaling();
+      }, RECONNECT_DELAY * this.reconnectAttempts);
+    } else {
+      this.events.onStatus("", "error", err.message ?? "Connection error");
+    }
+  }
+
+  /** The signaling Peer object itself died (not just one leg) — restart it, then redial everyone we originally dialed out
+   *  to. Participants who dialed *us* can't be redialed by us; they'll reconnect once our new id reaches them, which (same
+   *  as before group calls existed) only happens via the room record, not automatically — a known, pre-existing limit. */
+  private rejoinSignaling() {
+    if (this.peer && !this.peer.destroyed) return;
+    const oldId = this.myId;
+    const remoteIds = [...this.sessions.keys()];
+    this.start().then(newId => {
+      if (newId !== oldId) this.events.onIdChanged?.(newId, oldId);
+      for (const id of remoteIds) this.connectTo(id, this.localStream);
+    }).catch(() => { /* surfaced via onStatus already */ });
+  }
+
+  /** Call once the camera/mic stream is ready — answers any calls that arrived before it was, and lets future incoming calls answer immediately. */
+  answerWithStream(stream: MediaStream) {
+    this.localStream = stream;
+    for (const session of this.sessions.values()) session.answerWithStream(stream);
+  }
+
+  /** Connect to one more participant (host-side: calling out to a newly-joined guest; guest-side: calling out to everyone
+   *  already in the room). A no-op past the cap, and a no-op if we're already connected to them. */
+  connectTo(remoteId: string, stream: MediaStream | null) {
+    if (!this.peer) return;
+    const id = remoteId.trim();
+    if (!id || id === this.myId) return;
+    this.localStream = stream;
+    const existing = this.sessions.get(id);
+    if (existing?.isConnected) return;
+    if (!existing && this.sessions.size >= MAX_REMOTE_PEERS) return;
+    const session = existing ?? this.createSession(id, false);
+    session.connect(this.peer, stream);
+  }
+
+  /** Convenience for joining a room with several people already in it. */
+  connectToAll(remoteIds: string[], stream: MediaStream | null) {
+    for (const id of remoteIds) this.connectTo(id, stream);
+  }
+
+  get participantIds(): string[] { return [...this.sessions.keys()]; }
+  get participantCount(): number { return this.sessions.size; }
+  get roomFull(): boolean { return this.sessions.size >= MAX_REMOTE_PEERS; }
+
+  /** Drop one participant without ending the call for everyone else. */
+  hangupPeer(peerId: string) {
+    this.sessions.get(peerId)?.hangup();
+    this.sessions.delete(peerId);
+  }
+
+  // ── Broadcast sends: every mode fans its frame out to every currently-connected session. Each session quantizes/encodes
+  // independently (see the PeerSession class doc comment) — this is the real per-participant CPU cost of a mesh call.
+
+  sendAsciiFrame(charIndices: ArrayLike<number>, w: number, h: number, charset: string) {
+    for (const s of this.sessions.values()) s.sendAsciiFrame(charIndices, w, h, charset);
+  }
+
+  /** Returns the first session's encoded result (purely so the local self-preview has something to paint) — what's actually
+   *  sent to each peer is still encoded independently inside the loop. */
+  sendAsciiColorFrame(
+    charIndices: ArrayLike<number>, w: number, h: number, charset: string, rgba: Uint8ClampedArray | Uint8Array
+  ): { palette: Uint8Array; indices: Uint8Array } | null {
+    let first: { palette: Uint8Array; indices: Uint8Array } | null = null;
+    for (const s of this.sessions.values()) {
+      const r = s.sendAsciiColorFrame(charIndices, w, h, charset, rgba);
+      if (!first) first = r;
+    }
+    return first;
+  }
+
+  sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false): { palette: Uint8Array; indices: Uint8Array } | null {
+    let first: { palette: Uint8Array; indices: Uint8Array } | null = null;
+    for (const s of this.sessions.values()) {
+      const r = s.sendColorFrame(rgba, w, h, pixelated);
+      if (!first) first = r;
+    }
+    return first;
+  }
+
+  sendAdaptiveFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixel = false) {
+    for (const s of this.sessions.values()) s.sendAdaptiveFrame(rgba, w, h, pixel);
+  }
+
+  /** Only when EVERY connected session can do real video — one captured frame has to serve all of them, and a session
+   *  stuck on the quadtree codec can't use a video-shaped frame. Mixed capability falls everyone back to the quadtree
+   *  codec instead, rather than needing two differently-sized captures per render tick. */
+  videoPlan(vw: number, vh: number, scale = 1): { w: number; h: number } | null {
+    const open = [...this.sessions.values()].filter(s => s.isConnected);
+    if (open.length === 0) return null;
+    for (const s of open) if (s.videoCodec === null) return null;
+    let w = Infinity, h = Infinity;
+    for (const s of open) {
+      const p = s.videoPlan(vw, vh, scale);
+      if (!p) return null;
+      w = Math.min(w, p.w); h = Math.min(h, p.h);
+    }
+    return { w, h };
+  }
+
+  sendVideoFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number): boolean {
+    let any = false;
+    for (const s of this.sessions.values()) if (s.sendVideoFrame(rgba, w, h)) any = true;
+    return any;
+  }
+
+  sendState(micMuted: boolean, camOff: boolean) {
+    for (const s of this.sessions.values()) s.sendState(micMuted, camOff);
+  }
+
+  /** The render loop fires whenever ANY connected session wants a frame; sessions that don't yet (a slower/more congested
+   *  peer) self-throttle their own send — unchanged from the single-peer version, just per-session now. */
+  isSendDue(): boolean {
+    for (const s of this.sessions.values()) if (s.isSendDue()) return true;
+    return false;
+  }
+
+  setFpsCap(cap: number) { for (const s of this.sessions.values()) s.setFpsCap(cap); }
+  get currentFps(): number {
+    let min = Infinity;
+    for (const s of this.sessions.values()) min = Math.min(min, s.currentFps);
+    return Number.isFinite(min) ? min : 30;
+  }
+
+  /** The most conservative quality level across all connected peers — used only to decide how hard to push the shared
+   *  capture resolution; each session still separately adapts its own actual send quality. */
+  getQualityLevel(): CallQualityLevel {
+    let worst = QUALITY_ORDER.length - 1;
+    for (const s of this.sessions.values()) worst = Math.min(worst, QUALITY_ORDER.indexOf(s.getQualityLevel()));
+    return QUALITY_ORDER[Math.max(0, worst)];
+  }
+
+  getMyId(): string { return this.myId; }
+
+  getStats() {
+    const per: Record<string, ReturnType<PeerSession["getStats"]>> = {};
+    for (const [id, s] of this.sessions) per[id] = s.getStats();
+    return per;
+  }
+
+  hangup() {
+    this.destroyed = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.reconnectAttempts = 0;
+    for (const s of this.sessions.values()) s.hangup();
+    this.sessions.clear();
+    try { this.peer?.destroy(); } catch { /* noop */ }
+    this.peer = null;
+  }
+
+  get isConnected(): boolean {
+    for (const s of this.sessions.values()) if (s.isConnected) return true;
+    return false;
+  }
 }
