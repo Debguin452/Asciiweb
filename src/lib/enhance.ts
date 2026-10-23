@@ -12,14 +12,24 @@
 //
 // Priority 2 pass (items 11/12/13/16):
 //   11: contrast now adapts to the frame's own luminance variance — a low-contrast scene (small stddev) gets pushed
-//       toward CONTRAST_MAX, an already-contrasty scene gets pulled back toward CONTRAST_MIN, computed from sum/sumSq
-//       accumulated in the SAME luminance pass above (no extra traversal).
+//       toward CONTRAST_MAX, an already-contrasty scene gets pulled back toward CONTRAST_BASE, computed from sum/sumSq
+//       accumulated in the SAME luminance pass above (no extra traversal). A brightness-safety factor (see
+//       BRIGHTNESS_Q below) limits how much of that boost a dark or bright scene actually receives: the contrast LUT
+//       stretches around a FIXED pivot of 128, not the frame's own mean, so pushing extra contrast on a scene whose
+//       mean sits far from 128 drags its darker/brighter pixels toward the 0/255 clamp — crushing shadow or highlight
+//       detail into a flat clip rather than genuinely improving contrast. Verified empirically: an early version of this
+//       (variance-only, no brightness limit) measurably increased shadow-stripe clipping and lost distinguishable dark
+//       levels versus the pre-Priority-2 fixed-1.15 baseline on a clean step-gradient test. The brightness-safety factor
+//       keeps a dark/bright scene's contrast within ~1 percentage point of clipping at the ORIGINAL fixed-1.15 baseline
+//       (bench-verified), while a scene whose mean sits near mid-gray still gets the full adaptive range.
 //   12: an optional mild gamma can be folded into the same LUT (ENABLE_GAMMA toggle) — off by default since the existing
 //       look was tuned without it; left wired up and bench-verified so it's a one-line flip if wanted later.
 //   13: gamma + contrast are combined into ONE 256-entry LUT, rebuilt only when the smoothed contrast actually drifted
 //       past LUT_EPS — not every frame, so the "precomputed" benefit from Priority 1 is preserved.
 //   16: the contrast target is EMA-smoothed frame to frame (same x += (target-x)*alpha idiom as governor.ts/denoise.ts)
 //       so panning across a scene with a different luminance spread doesn't visibly snap the contrast, only drift it.
+//       EMA state resets when the frame's dimensions change (new call, different resolution, camera switch) so a new
+//       scene starts from its own target instead of inheriting the previous scene's smoothed value.
 //
 // Item 15 (skip the enhancement pass entirely on a near-static frame) was prototyped and bench-tested but NOT shipped:
 // with realistic per-pixel sensor noise the skip essentially never triggers (the frame-to-frame luma diff rarely drops
@@ -38,14 +48,21 @@ const NOISE_FLOOR = 4; // luma units (0-255); |unsharp diff| below this is treat
 // or not gamma is on, without a second weighted-sum multiply-add.
 const SAT_FP = Math.round(SATURATION * 4096);
 
-// Adaptive contrast (item 11): contrastTarget = CONTRAST_BASE * (REF_STD / frameStdDev), clamped to [MIN, MAX]. A flat,
+// Adaptive contrast (item 11): varianceTarget = CONTRAST_BASE * (REF_STD / frameStdDev), clamped to [MIN, MAX]. A flat,
 // low-contrast frame (small stddev) pushes the ratio above 1, boosting contrast toward CONTRAST_MAX; an already-punchy
-// frame pulls it back toward CONTRAST_MIN. REF_STD is a "typical" webcam-scene luma stddev, not derived from any one
+// frame pulls it back toward CONTRAST_BASE. REF_STD is a "typical" webcam-scene luma stddev, not derived from any one
 // capture — the clamp keeps the effect subtle regardless.
 const CONTRAST_BASE = 1.15;
 const CONTRAST_MIN = 1.05;
 const CONTRAST_MAX = 1.25;
 const REF_STD = 50;
+// Brightness-safety factor: only the portion of varianceTarget ABOVE CONTRAST_BASE is scaled by this, so a dark or
+// bright scene can still fall back to today's fixed-1.15 look but is never pushed further toward CONTRAST_MAX (see the
+// file header for why — it's the fixed-128 contrast pivot dragging shadow/highlight pixels toward the clamp).
+// min(m, 1-m) is the frame's mean distance from whichever edge (0 or 255) it's closer to, normalized to [0, 0.5];
+// BRIGHTNESS_Q=0.4 means that distance needs to reach 0.4 (mean within [102,153]) before the scene gets the full
+// adaptive range; the ^2 gives a soft, not abrupt, falloff as the mean approaches either edge.
+const BRIGHTNESS_Q = 0.4;
 const CONTRAST_ALPHA = 0.06; // EMA smoothing (item 16) — ~1-2s to settle at 30fps, same idiom as governor.ts/denoise.ts
 const LUT_EPS = 0.01; // only rebuild the LUT once the smoothed contrast actually drifted this far
 
@@ -91,9 +108,12 @@ function writeFlatRow(src: Uint8ClampedArray, dst: Uint8ClampedArray, lumaArr: U
 
 function run(src: Uint8ClampedArray, w: number, h: number): ImageData {
   const n = w * h;
-  if (!out || out.width !== w || out.height !== h) out = new ImageData(w, h);
+  const resized = !out || out.width !== w || out.height !== h;
+  if (resized) out = new ImageData(w, h);
+  const img = out!; // always non-null here: either just assigned above, or resized was false meaning out already was
   if (luma.length !== n) luma = new Uint8ClampedArray(n);
-  const dst = out.data;
+  if (resized) haveContrast = false; // new resolution/call/camera — don't inherit the previous scene's smoothed contrast
+  const dst = img.data;
 
   // Single luminance pass — also accumulates sum/sumSq for the adaptive-contrast variance estimate (item 11), so this
   // doesn't cost a second traversal over the frame.
@@ -107,7 +127,13 @@ function run(src: Uint8ClampedArray, w: number, h: number): ImageData {
   const variance = Math.max(0, sumSq / n - mean * mean);
   const stdDev = Math.sqrt(variance);
   const ratio = Math.min(1.3, Math.max(0.9, REF_STD / Math.max(stdDev, 1)));
-  const contrastTarget = Math.min(CONTRAST_MAX, Math.max(CONTRAST_MIN, CONTRAST_BASE * ratio));
+  const varianceTarget = Math.min(CONTRAST_MAX, Math.max(CONTRAST_MIN, CONTRAST_BASE * ratio));
+
+  const m = mean / 255;
+  const brightnessSafety = Math.pow(Math.min(1, Math.min(m, 1 - m) / BRIGHTNESS_Q), 2);
+  const boostAboveBase = Math.max(0, varianceTarget - CONTRAST_BASE) * brightnessSafety;
+  const contrastTarget = Math.max(CONTRAST_MIN, CONTRAST_BASE + boostAboveBase);
+
   if (!haveContrast) { smoothedContrast = contrastTarget; haveContrast = true; } // first frame: jump straight there
   else smoothedContrast += (contrastTarget - smoothedContrast) * CONTRAST_ALPHA;
   if (!Number.isFinite(lutContrast) || Math.abs(smoothedContrast - lutContrast) > LUT_EPS) buildLut(smoothedContrast);
@@ -143,5 +169,5 @@ function run(src: Uint8ClampedArray, w: number, h: number): ImageData {
 
     writePixel(src, dst, luma, rowBase, w - 1); // right border column
   }
-  return out;
+  return img;
 }
