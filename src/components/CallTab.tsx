@@ -9,6 +9,7 @@ import { CallManager, MAX_REMOTE_PEERS, type CallStatus, type RemoteState } from
 import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary";
 import { enhance } from "../lib/enhance";
 import { FrameGovernor } from "../lib/governor";
+import { record as recordPerf, sizedBucket, logSummary as logPerfSummary } from "../lib/perfStats";
 import CallGrid, { type GridTile } from "./CallGrid";
 
 interface Props {
@@ -105,7 +106,19 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   const cctx = cv.getContext("2d", { willReadFrequently: true })!;
   if (img instanceof HTMLCanvasElement) {
     cctx.drawImage(img, 0, 0);
-    const out = pixelated || !enhanceFrame ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
+    // This is the Priority 3 audit's finding #1 (docs/priority3-pipeline-audit.md): a second, avoidable full-frame
+    // CPU readback on the receive side, just to feed enhance(). Timed here (not removed yet) to get real on-device
+    // numbers before changing it — see perfStats.ts.
+    let out: ImageData | null = null;
+    if (!pixelated && enhanceFrame) {
+      const t0 = performance.now();
+      const data = cctx.getImageData(0, 0, w, h).data;
+      const t1 = performance.now();
+      out = enhance(data, w, h);
+      const t2 = performance.now();
+      recordPerf(sizedBucket("receive-readback", w, h), t1 - t0);
+      recordPerf(sizedBucket("receive-enhance", w, h), t2 - t1);
+    }
     if (out) cctx.putImageData(out, 0, 0);
   } else cctx.putImageData((pixelated || !enhanceFrame ? null : enhance(img.data, w, h)) ?? img, 0, 0);
   if (square) {
@@ -255,7 +268,10 @@ function sampleColorFrame(
   if (mirror) { ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, vw, vh, -iw, 0, iw, ih); }
   else ctx.drawImage(video, 0, 0, vw, vh, 0, 0, iw, ih);
   ctx.restore();
-  return ctx.getImageData(0, 0, iw, ih);
+  const t0 = performance.now();
+  const img = ctx.getImageData(0, 0, iw, ih);
+  recordPerf(sizedBucket("capture-readback", iw, ih), performance.now() - t0);
+  return img;
 }
 
 // 19-step ramp (5 bits/char): the stock 10-step ramp bands faces into a few flat tones. Used unless the user chose a ramp of their own with ≥14 distinct chars.
@@ -1043,6 +1059,18 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   }, [screen]);
 
   useEffect(() => () => { streamRef.current?.getTracks().forEach(t => t.stop()); }, []);
+
+  // Priority 3 item 17 measurement phase only (see perfStats.ts / docs/priority3-pipeline-audit.md) — prints the
+  // readback/enhance timing breakdown to the console every 10s during a call, so numbers can be read straight off a
+  // phone's remote-debugging console without needing to call `__perfStats.logSummary()` manually. Safe to delete once
+  // the measurement phase is done; it only reads timing data, never changes behavior.
+  useEffect(() => {
+    if (screen !== "in-call") return;
+    const id = setInterval(() => {
+      logPerfSummary(`mode=${callModeRef.current} tiles=${participants.length}`);
+    }, 10000);
+    return () => clearInterval(id);
+  }, [screen, participants.length]);
 
   // Returns whether the camera actually started — callers must check this
   // (this used to throw-swallow internally, which meant `try { await
