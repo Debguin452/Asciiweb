@@ -105,22 +105,22 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   if (cv.height !== h) cv.height = h;
   const cctx = cv.getContext("2d", { willReadFrequently: true })!;
   if (img instanceof HTMLCanvasElement) {
+    // As of the Priority 3 finding-#1 fix, nothing produces a RemoteFrame with `canvas` set any more — video-codec
+    // frames now arrive as `image` (an ImageData read once, on the decoder's own offscreen canvas — see call.ts's
+    // videoRx.onFrame and videocodec.ts's readPixels()) and take the `else` branch below instead. Left in place as a
+    // defensive fallback rather than removed, in case something else starts passing a canvas again later.
     cctx.drawImage(img, 0, 0);
-    // This is the Priority 3 audit's finding #1 (docs/priority3-pipeline-audit.md): a second, avoidable full-frame
-    // CPU readback on the receive side, just to feed enhance(). Timed here (not removed yet) to get real on-device
-    // numbers before changing it — see perfStats.ts.
+    const out = pixelated || !enhanceFrame ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
+    if (out) cctx.putImageData(out, 0, 0);
+  } else {
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
       const t0 = performance.now();
-      const data = cctx.getImageData(0, 0, w, h).data;
-      const t1 = performance.now();
-      out = enhance(data, w, h);
-      const t2 = performance.now();
-      recordPerf(sizedBucket("receive-readback", w, h), t1 - t0);
-      recordPerf(sizedBucket("receive-enhance", w, h), t2 - t1);
+      out = enhance(img.data, w, h);
+      recordPerf(sizedBucket("receive-enhance", w, h), performance.now() - t0);
     }
-    if (out) cctx.putImageData(out, 0, 0);
-  } else cctx.putImageData((pixelated || !enhanceFrame ? null : enhance(img.data, w, h)) ?? img, 0, 0);
+    cctx.putImageData(out ?? img, 0, 0);
+  }
   if (square) {
     if (cv.dataset.k !== "fill") {
       cv.dataset.k = "fill";
