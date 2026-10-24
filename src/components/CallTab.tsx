@@ -10,7 +10,7 @@ import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary"
 import { enhance } from "../lib/enhance";
 import { FrameGovernor } from "../lib/governor";
 import { record as recordPerf, sizedBucket, logSummary as logPerfSummary } from "../lib/perfStats";
-import { VIDEO_CODEC_NAME } from "../lib/videocodec";
+import { VIDEO_CODEC_NAME, webCodecsAvailable } from "../lib/videocodec";
 import CallGrid, { type GridTile } from "./CallGrid";
 
 interface Props {
@@ -1087,7 +1087,18 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
       // readback at all; see call.ts's PeerSession.getStats()).
       const codecs = callRef.current?.getStats();
       const codecStr = codecs
-        ? Object.entries(codecs).map(([id, s]) => `${id.slice(0, 6)}:${s.videoCodec === null ? "quadtree" : VIDEO_CODEC_NAME[s.videoCodec]}`).join(" ")
+        ? Object.entries(codecs).map(([id, s]) => {
+            const neg = s.videoCodec === null ? "quadtree" : VIDEO_CODEC_NAME[s.videoCodec];
+            // When it's quadtree, say WHY: no local encoder support at all, no codec the remote can decode, or a
+            // shared codec existed but something else blocked it (error/disabled — see PeerSession.videoCodec).
+            const why = s.videoCodec !== null ? "" :
+              !webCodecsAvailable() ? " (no WebCodecs API)" :
+              s.localEncoders.length === 0 ? " (this device can't encode any supported codec)" :
+              !s.remoteDecoders || s.remoteDecoders.length === 0 ? " (remote hasn't reported decode support yet, or can't decode any)" :
+              s.localEncoders.some(c => s.remoteDecoders!.includes(c)) ? " (shared codec exists but is disabled/errored)" :
+              ` (no overlap: we encode [${s.localEncoders.map(c => VIDEO_CODEC_NAME[c]).join(",")}], they decode [${s.remoteDecoders.map(c => VIDEO_CODEC_NAME[c]).join(",")}])`;
+            return `${id.slice(0, 6)}:${neg}${why}`;
+          }).join(" ")
         : "";
       logPerfSummary(`mode=${callModeRef.current} tiles=${participants.length} codecs=[${codecStr}]`);
     }, 10000);
