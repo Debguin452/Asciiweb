@@ -10,6 +10,7 @@ import { ColorQuantizer, fillLiftedRgba, type RemoteFrame } from "../lib/binary"
 import { enhance } from "../lib/enhance";
 import { FrameGovernor } from "../lib/governor";
 import { record as recordPerf, sizedBucket, logSummary as logPerfSummary } from "../lib/perfStats";
+import { VIDEO_CODEC_NAME } from "../lib/videocodec";
 import CallGrid, { type GridTile } from "./CallGrid";
 
 interface Props {
@@ -1067,7 +1068,14 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
   useEffect(() => {
     if (screen !== "in-call") return;
     const id = setInterval(() => {
-      logPerfSummary(`mode=${callModeRef.current} tiles=${participants.length}`);
+      // Which codec each peer pairing actually landed on — "decode-readback" only ever gets written when a peer is on
+      // a video codec (null below means that peer fell back to the quadtree codec, which never does a receive-side
+      // readback at all; see call.ts's PeerSession.getStats()).
+      const codecs = callRef.current?.getStats();
+      const codecStr = codecs
+        ? Object.entries(codecs).map(([id, s]) => `${id.slice(0, 6)}:${s.videoCodec === null ? "quadtree" : VIDEO_CODEC_NAME[s.videoCodec]}`).join(" ")
+        : "";
+      logPerfSummary(`mode=${callModeRef.current} tiles=${participants.length} codecs=[${codecStr}]`);
     }, 10000);
     return () => clearInterval(id);
   }, [screen, participants.length]);
