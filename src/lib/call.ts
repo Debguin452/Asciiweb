@@ -226,14 +226,17 @@ class PeerSession {
     this.videoTx.onPacket = (buf, key) => this.dispatchVideo(buf, key);
     this.videoTx.onFailure = () => { this.videoDisabled = true; this.needKeyframe = true; };
     this.videoRx.onFrame = () => {
-      // Read pixels here, once, from the decoder's own offscreen canvas (videocodec.ts's readPixels()) instead of
-      // handing the caller a raw <canvas> to redraw-and-read-back itself — see readPixels()'s comment for why.
-      const pixels = this.videoRx.readPixels();
-      if (!pixels) return;
+      // Deliberately NOT reading pixels here: this fires once per DECODED frame, before CallTab's rAF coalescing gets
+      // a chance to drop stale ones (it only ever paints the latest pending frame, once per display tick). An earlier
+      // version of this fix called the readback here, eagerly — turning "N decodes → 1 readback" into "N decodes → N
+      // readbacks" whenever frames arrived faster than they could be painted, which on-device measurement showed was
+      // far WORSE than the original double-draw it was meant to replace (median 51-71ms, max 1384ms vs. the original's
+      // 10-30ms median). The canvas reference itself is cheap to hand over; CallTab reads it lazily, once per paint.
+      const c = this.videoRx.canvas;
       this.prevRecvFrame = null;
       this.events.onRemoteFrame({
-        w: pixels.width, h: pixels.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
-        isKeyframe: false, isBlockColor: false, isPixelated: false, image: pixels, timestamp: performance.now(),
+        w: c.width, h: c.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
+        isKeyframe: false, isBlockColor: false, isPixelated: false, canvas: c, timestamp: performance.now(),
       });
     };
     this.videoRx.onNeedKey = () => this.requestKeyframe();

@@ -11,8 +11,6 @@
  * (0xC0 can't collide: legacy ASCII/colour frames never set bit 7, quadtree packets set bit 7 but never bit 6.)
  */
 
-import { record as recordPerf, sizedBucket } from "./perfStats";
-
 export const VIDEO_PACKET_MASK = 0xc0;
 
 export type VideoCodecId = 0 | 1 | 2;
@@ -170,11 +168,15 @@ export class VideoSender {
 }
 
 export class VideoReceiver {
-  /** The decoded picture; redrawn into on every output frame. Never attached to the DOM — see readPixels(). */
+  /**
+   * The decoded picture; redrawn into on every output frame. Never attached to the DOM. The caller (CallTab.tsx's
+   * paintCanvas, via RemoteFrame.canvas) reads pixels directly off THIS canvas, lazily, once per rAF-coalesced paint —
+   * not here, and not once per decoded frame. See call.ts's videoRx.onFrame for why that distinction matters (an
+   * earlier version of this fix got it backwards and measured worse than the original double-draw it replaced).
+   * willReadFrequently is still requested up front so whichever context ends up reading this canvas gets it (a second
+   * getContext() call on the same canvas returns this same context, options and all).
+   */
   readonly canvas: HTMLCanvasElement = document.createElement("canvas");
-  // willReadFrequently: this canvas exists purely so readPixels() can read it back every frame — the hint should keep
-  // (or move) it onto a software-backed readback path, rather than paying the GPU-compositor sync cost a displayed
-  // canvas does for the same call (see readPixels()'s comment and docs/priority3-pipeline-audit.md finding #1).
   private ctx = this.canvas.getContext("2d", { willReadFrequently: true });
   private dec: VideoDecoder | null = null;
   private cfgKey = "";
@@ -193,22 +195,6 @@ export class VideoReceiver {
   close() {
     try { this.dec?.close(); } catch { /* already closed */ }
     this.dec = null; this.cfgKey = ""; this.haveKey = false;
-  }
-
-  /**
-   * Reads the just-decoded picture into CPU-accessible pixels, from this already-offscreen canvas — instead of the
-   * caller drawing it onto a second, DOM-displayed canvas and reading THAT back, which earlier on-device measurement
-   * (Priority 3 item 17's audit + the perfStats numbers that followed) showed costing far more than pixel count alone
-   * would predict: a readback from a canvas that's actively on screen has to synchronize with the GPU compositor first
-   * on many mobile browsers, even with willReadFrequently set, in a way an always-offscreen canvas shouldn't need to.
-   * Returns null only if nothing has been decoded yet (0×0 canvas) — callers should just skip that frame.
-   */
-  readPixels(): ImageData | null {
-    if (!this.ctx || !this.canvas.width || !this.canvas.height) return null;
-    const t0 = performance.now();
-    const img = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
-    recordPerf(sizedBucket("decode-readback", this.canvas.width, this.canvas.height), performance.now() - t0);
-    return img;
   }
 
   /** Packets are handled strictly in order (configuring a decoder is async). */
