@@ -667,7 +667,14 @@ class PeerSession {
 
   getQualityLevel(): CallQualityLevel { return this.qualityLevel; }
   getStats() {
-    return { quality: this.qualityLevel, fps: this.targetFps, keyframeInterval: this.keyframeInterval, latency: Math.round(this.rtt), drops: this.recentDrops };
+    return {
+      quality: this.qualityLevel, fps: this.targetFps, keyframeInterval: this.keyframeInterval,
+      latency: Math.round(this.rtt), drops: this.recentDrops,
+      // null = this peer pairing is on the quadtree codec (either side lacks WebCodecs, no shared codec, or an
+      // encode/decode error fell back) — exposed so it's visible which pipeline (and which perfStats buckets:
+      // decode-readback+receive-enhance vs receive-enhance-only) actually applies to a given call.
+      videoCodec: this.videoCodec,
+    };
   }
   get isConnected() { return !!this.dataConn?.open; }
 }

@@ -25,6 +25,9 @@ const CODEC_STRING: Record<VideoCodecId, string> = {
   2: "vp09.00.10.08",     // VP9 profile 0, 8-bit
 };
 
+/** Human-readable names for diagnostics (e.g. CallTab's periodic perfStats log) — not used by the codec itself. */
+export const VIDEO_CODEC_NAME: Record<VideoCodecId, string> = { 0: "h264", 1: "vp8", 2: "vp9" };
+
 export const webCodecsAvailable = (): boolean =>
   typeof VideoEncoder !== "undefined" && typeof VideoDecoder !== "undefined" && typeof VideoFrame !== "undefined";
 
