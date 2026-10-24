@@ -226,11 +226,14 @@ class PeerSession {
     this.videoTx.onPacket = (buf, key) => this.dispatchVideo(buf, key);
     this.videoTx.onFailure = () => { this.videoDisabled = true; this.needKeyframe = true; };
     this.videoRx.onFrame = () => {
-      const c = this.videoRx.canvas;
+      // Read pixels here, once, from the decoder's own offscreen canvas (videocodec.ts's readPixels()) instead of
+      // handing the caller a raw <canvas> to redraw-and-read-back itself — see readPixels()'s comment for why.
+      const pixels = this.videoRx.readPixels();
+      if (!pixels) return;
       this.prevRecvFrame = null;
       this.events.onRemoteFrame({
-        w: c.width, h: c.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
-        isKeyframe: false, isBlockColor: false, isPixelated: false, canvas: c, timestamp: performance.now(),
+        w: pixels.width, h: pixels.height, charset: "", charIndices: new Uint8Array(0), palette: null, colorIndices: null,
+        isKeyframe: false, isBlockColor: false, isPixelated: false, image: pixels, timestamp: performance.now(),
       });
     };
     this.videoRx.onNeedKey = () => this.requestKeyframe();
