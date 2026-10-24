@@ -677,6 +677,10 @@ class PeerSession {
       // encode/decode error fell back) — exposed so it's visible which pipeline (and which perfStats buckets:
       // decode-readback+receive-enhance vs receive-enhance-only) actually applies to a given call.
       videoCodec: this.videoCodec,
+      // For diagnosing why videoCodec might be null: this browser's own encodable codecs vs. what the remote side told
+      // us it can decode (received once over the data channel as a "caps" message, see attachData()).
+      localEncoders: this.encCodecs,
+      remoteDecoders: this.remoteDec,
     };
   }
   get isConnected() { return !!this.dataConn?.open; }
