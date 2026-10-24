@@ -106,13 +106,27 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
   if (cv.height !== h) cv.height = h;
   const cctx = cv.getContext("2d", { willReadFrequently: true })!;
   if (img instanceof HTMLCanvasElement) {
-    // As of the Priority 3 finding-#1 fix, nothing produces a RemoteFrame with `canvas` set any more — video-codec
-    // frames now arrive as `image` (an ImageData read once, on the decoder's own offscreen canvas — see call.ts's
-    // videoRx.onFrame and videocodec.ts's readPixels()) and take the `else` branch below instead. Left in place as a
-    // defensive fallback rather than removed, in case something else starts passing a canvas again later.
-    cctx.drawImage(img, 0, 0);
-    const out = pixelated || !enhanceFrame ? null : enhance(cctx.getImageData(0, 0, w, h).data, w, h);
+    // `img` here is videocodec.ts's VideoReceiver.canvas — already offscreen, never DOM-attached. Priority 3 finding
+    // #1 (docs/priority3-pipeline-audit.md): the original code drew it onto `cv` (the DOM-displayed overlay canvas)
+    // and read THAT back, which on-device measurement showed costing far more than pixel count alone would predict —
+    // consistent with the known mobile-Canvas2D cost of a displayed canvas having to sync with the GPU compositor
+    // before a readback can complete. Reading `img` directly instead avoids that, AND avoids a wasted draw+redraw.
+    // This call site only runs once per rAF-coalesced paint (paintRemote's caller already discards stale frames before
+    // it gets here) — that throttling matters as much as where the read happens: an eager per-decoded-frame readback
+    // (tried and reverted — see call.ts's videoRx.onFrame) measured far worse, because it ran once per decode instead
+    // of once per display tick.
+    let out: ImageData | null = null;
+    if (!pixelated && enhanceFrame) {
+      const srcCtx = img.getContext("2d", { willReadFrequently: true });
+      if (srcCtx) {
+        const t0 = performance.now();
+        const data = srcCtx.getImageData(0, 0, w, h).data;
+        recordPerf(sizedBucket("decode-readback", w, h), performance.now() - t0);
+        out = enhance(data, w, h);
+      }
+    }
     if (out) cctx.putImageData(out, 0, 0);
+    else cctx.drawImage(img, 0, 0); // no enhancement to apply (or couldn't get a context) — a plain draw, no readback at all
   } else {
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
