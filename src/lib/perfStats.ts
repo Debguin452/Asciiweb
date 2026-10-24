@@ -53,13 +53,26 @@ export function getSummary(): Record<string, Summary> {
   return out;
 }
 
-/** Prints a table to the console — call manually (e.g. `__perfStats.logSummary()` in devtools) or on the periodic
- *  timer CallTab sets up while a call is active. `context` is free-form info to print alongside (tile count, mode). */
+/** Prints a compact one-line summary to the console — call manually (e.g. `__perfStats.logSummary()` in devtools) or on
+ *  the periodic timer CallTab sets up while a call is active. `context` is free-form info to print alongside (tile
+ *  count, mode).
+ *
+ *  Deliberately NOT console.table(): over a remote-debugging connection every cell has to be serialized across the
+ *  inspector protocol, and with enough buckets that observably blocked the main thread for 100+ ms right at the
+ *  moment it fired (a `setInterval` "Violation" was traced directly to this call) — the measurement tool was adding
+ *  more jank than the thing it measured. A single formatted string is orders of magnitude cheaper to log.
+ */
 export function logSummary(context?: string) {
   const s = getSummary();
-  if (Object.keys(s).length === 0) return;
-  if (context) console.log(`[perfStats] ${context}`);
-  console.table(s);
+  const keys = Object.keys(s);
+  if (keys.length === 0) return;
+  const line = keys
+    .map((k) => {
+      const b = s[k];
+      return `${k}: n=${b.count} mean=${b.mean.toFixed(1)} p95=${b.p95.toFixed(1)} max=${b.max.toFixed(1)}`;
+    })
+    .join(" | ");
+  console.log(`[perfStats]${context ? ` ${context}` : ""} ${line}`);
 }
 
 export function resetStats() {
