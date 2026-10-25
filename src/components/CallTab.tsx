@@ -58,8 +58,14 @@ const TILE_FIT = "cover";
 // the EMA of readback time crosses ENHANCE_BUDGET_MS we stop paying it most frames (plain drawImage, no CPU readback at
 // all) and only re-probe occasionally, so a slow device degrades to "picture without sharpening" instead of staying
 // consistently over frame budget. Same EMA/hysteresis idiom as governor.ts/denoise.ts.
+// Keyed by frame SIZE too (not just tile), not only the tile: the adaptive-quality logic changes a peer's video
+// dimensions fairly often (congestion, tier ramp-up at call start), and a brief run of frames at a transiently larger
+// size would otherwise push one shared EMA over budget, disabling enhancement for the *next* ~30-frame probe window even
+// after the codec settled back to a size that was always cheap — observed as enhancement visibly flickering on and off
+// every ~30th frame rather than just degrading once and staying degraded. Per-size state means a size that's proven
+// cheap stays enabled regardless of what other sizes the call passed through.
 interface EnhanceGate { emaMs: number; probeCounter: number }
-const enhanceGates = new WeakMap<HTMLPreElement, EnhanceGate>();
+const enhanceGates = new WeakMap<HTMLPreElement, Map<string, EnhanceGate>>();
 const ENHANCE_BUDGET_MS = 20;   // ~60% of a 33ms/30fps frame budget — above this, readback is costing too much to pay every frame
 const ENHANCE_PROBE_EVERY = 30; // while over budget, re-measure every 30th frame rather than never, so recovery is noticed
 const ENHANCE_ALPHA = 0.2;
@@ -131,8 +137,11 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
     // of once per display tick.
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
-      let gate = enhanceGates.get(pre);
-      if (!gate) { gate = { emaMs: 0, probeCounter: 0 }; enhanceGates.set(pre, gate); }
+      let sizeGates = enhanceGates.get(pre);
+      if (!sizeGates) { sizeGates = new Map(); enhanceGates.set(pre, sizeGates); }
+      const sizeKey = `${w}x${h}`;
+      let gate = sizeGates.get(sizeKey);
+      if (!gate) { gate = { emaMs: 0, probeCounter: 0 }; sizeGates.set(sizeKey, gate); }
       // Under budget (or never measured yet): always pay for readback+enhance, and keep updating the EMA. Over budget:
       // skip the readback entirely most frames (cheap drawImage below) and only re-probe periodically, so a device that
       // recovers (other tabs closed, thermal throttling eases) gets re-detected instead of staying disabled forever.
