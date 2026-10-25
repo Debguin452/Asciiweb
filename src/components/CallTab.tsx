@@ -105,12 +105,19 @@ function fitFont(pre: HTMLPreElement, area: HTMLElement | null, w: number, h: nu
   pre.style.lineHeight = "1.1";
 }
 
+// Priority 3 audit finding #5: plain-ASCII rebuilt the string every frame AND always wrote it to the DOM, unlike
+// color-ASCII's sibling path (paintColorAscii below) which already skips the DOM write when the built string is
+// identical to last frame's. Reusing the same `lastHtml` WeakMap here closes that gap — the string build itself still
+// happens every frame (there's no cheaper way to know it's unchanged without comparing something else first), but
+// `pre.textContent =`, which can trigger layout/reflow even when the content doesn't actually differ, is now skipped on
+// a static scene. Safe to share the map with the HTML-mode path: only one mode is ever active on a given `pre` at a
+// time, and the first frame after a mode switch always has a formatting mismatch (plain text vs span-wrapped HTML) that
+// correctly forces the write.
 function paintText(pre: HTMLPreElement, area: HTMLElement | null, text: string, w: number, h: number) {
   leaveCanvasMode(pre);
   area?.classList.remove("call-area-dark");
-  lastHtml.delete(pre);
   fitFont(pre, area, w, h);
-  pre.textContent = text;
+  if (lastHtml.get(pre) !== text) { lastHtml.set(pre, text); pre.textContent = text; }
 }
 
 /** Color frames are w×h solid blocks, so they are drawn as a tiny image and smoothly scaled — no per-cell DOM spans. */
