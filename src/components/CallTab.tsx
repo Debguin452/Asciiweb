@@ -50,6 +50,20 @@ const cvMap  = new WeakMap<HTMLPreElement, HTMLCanvasElement>();
 const imgMap = new WeakMap<HTMLCanvasElement, ImageData>();
 const TILE_FIT = "cover";
 
+// Receive-side enhance circuit breaker, video-codec frames only (paintCanvas's HTMLCanvasElement branch below). On-device
+// measurement (docs/priority3-pipeline-audit.md's "fixed" version) showed the decode-readback getImageData() call itself
+// staying expensive (~24ms median, 100ms+ p95 at a modest 112x144) regardless of whether the source canvas is displayed —
+// i.e. the original hypothesis (displayed-canvas GPU sync cost) wasn't the dominant factor; readback is just costly on
+// some devices/drivers, full stop. Rather than guess at a universal fix, this makes the cost self-limiting per tile: once
+// the EMA of readback time crosses ENHANCE_BUDGET_MS we stop paying it most frames (plain drawImage, no CPU readback at
+// all) and only re-probe occasionally, so a slow device degrades to "picture without sharpening" instead of staying
+// consistently over frame budget. Same EMA/hysteresis idiom as governor.ts/denoise.ts.
+interface EnhanceGate { emaMs: number; probeCounter: number }
+const enhanceGates = new WeakMap<HTMLPreElement, EnhanceGate>();
+const ENHANCE_BUDGET_MS = 20;   // ~60% of a 33ms/30fps frame budget — above this, readback is costing too much to pay every frame
+const ENHANCE_PROBE_EVERY = 30; // while over budget, re-measure every 30th frame rather than never, so recovery is noticed
+const ENHANCE_ALPHA = 0.2;
+
 function overlayCanvas(pre: HTMLPreElement): HTMLCanvasElement {
   let cv = cvMap.get(pre);
   if (!cv) {
@@ -117,16 +131,31 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
     // of once per display tick.
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
-      const srcCtx = img.getContext("2d", { willReadFrequently: true });
-      if (srcCtx) {
-        const t0 = performance.now();
-        const data = srcCtx.getImageData(0, 0, w, h).data;
-        recordPerf(sizedBucket("decode-readback", w, h), performance.now() - t0);
-        out = enhance(data, w, h);
+      let gate = enhanceGates.get(pre);
+      if (!gate) { gate = { emaMs: 0, probeCounter: 0 }; enhanceGates.set(pre, gate); }
+      // Under budget (or never measured yet): always pay for readback+enhance, and keep updating the EMA. Over budget:
+      // skip the readback entirely most frames (cheap drawImage below) and only re-probe periodically, so a device that
+      // recovers (other tabs closed, thermal throttling eases) gets re-detected instead of staying disabled forever.
+      const underBudget = gate.emaMs <= ENHANCE_BUDGET_MS;
+      let probe = underBudget;
+      if (!probe) { gate.probeCounter++; if (gate.probeCounter >= ENHANCE_PROBE_EVERY) { gate.probeCounter = 0; probe = true; } }
+      if (probe) {
+        const srcCtx = img.getContext("2d", { willReadFrequently: true });
+        if (srcCtx) {
+          const t0 = performance.now();
+          const data = srcCtx.getImageData(0, 0, w, h).data;
+          const readMs = performance.now() - t0;
+          recordPerf(sizedBucket("decode-readback", w, h), readMs);
+          gate.emaMs += (readMs - gate.emaMs) * ENHANCE_ALPHA;
+          // Only spend enhance()'s own (smaller but non-zero) cost if the readback we just paid for is still worth it —
+          // on a probe frame that just confirmed we're over budget, use the readback instead of wasting it, but don't
+          // let that single frame's result block the breaker from re-engaging next frame.
+          out = enhance(data, w, h);
+        }
       }
     }
     if (out) cctx.putImageData(out, 0, 0);
-    else cctx.drawImage(img, 0, 0); // no enhancement to apply (or couldn't get a context) — a plain draw, no readback at all
+    else cctx.drawImage(img, 0, 0); // no enhancement to apply (over budget, or couldn't get a context) — a plain draw, no readback at all
   } else {
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
