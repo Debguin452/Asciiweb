@@ -7,6 +7,9 @@ import {
   VideoSender, VideoReceiver, VIDEO_PACKET_MASK, VIDEO_CODEC_PREFERENCE, VIDEO_TIERS,
   probeEncoders, probeDecoders, videoDims, webCodecsAvailable, type VideoCodecId,
 } from "./videocodec";
+// Measurement only (see perfStats.ts) — used to decide WHETHER the quadtree quantize/encode path is actually worth
+// moving to WASM, instead of guessing. Same ring-buffer instrumentation already used on the receive side.
+import { record as recordPerf, sizedBucket } from "./perfStats";
 
 // Fallback ICE servers, used whenever /api/turn isn't configured (it isn't —
 // that was the Cloudflare-billed path, skipped in favor of this) or its
@@ -480,6 +483,46 @@ class PeerSession {
     return changed;
   }
 
+  /**
+   * Scene-change-aware keyframing (Priority 3 roadmap item 7): the fixed `keyframeInterval` (2-6s depending on fps
+   * tier) is fine for a steady scene, but a big cut — camera flip, a light switching on, someone stepping into frame —
+   * makes the next interval's worth of delta frames expensive to reconstruct correctly (quadtree/ASCII) or visibly wrong
+   * until the next scheduled keyframe (video codec). A sparse luma sample taken once per frame catches a frame-wide cut
+   * immediately without a second full-frame pass: SCENE_SAMPLES points is enough to reliably flag a global change while
+   * staying immune to ordinary local motion — a moving hand or talking face only touches a fraction of the sampled
+   * points, which is why the threshold is on the MEAN diff across all samples, not any single one. One shared method so
+   * all four frame-send paths (ascii-color, color, adaptive, video) get this for free rather than four copies of it.
+   */
+  private sceneSamples = new Uint8Array(0);
+  private sceneW = 0;
+  private sceneH = 0;
+  private static readonly SCENE_SAMPLES = 32;
+  private static readonly SCENE_CHANGE_THRESHOLD = 40; // mean luma diff (0-255) across sampled points — well above ordinary motion/lighting drift
+
+  private sceneChanged(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number): boolean {
+    const n = w * h;
+    if (n === 0) return false;
+    const samples = PeerSession.SCENE_SAMPLES;
+    const stride = Math.max(1, Math.floor(n / samples));
+    if (this.sceneSamples.length !== samples || this.sceneW !== w || this.sceneH !== h) {
+      this.sceneSamples = new Uint8Array(samples);
+      this.sceneW = w; this.sceneH = h;
+      for (let i = 0, p = 0; i < samples; i++, p += stride) {
+        const px = Math.min(n - 1, p) * 4;
+        this.sceneSamples[i] = (rgba[px] * 77 + rgba[px + 1] * 150 + rgba[px + 2] * 29) >> 8;
+      }
+      return false; // first frame at this size — nothing to compare against yet (resize already forces its own keyframe elsewhere)
+    }
+    let diffSum = 0;
+    for (let i = 0, p = 0; i < samples; i++, p += stride) {
+      const px = Math.min(n - 1, p) * 4;
+      const l = (rgba[px] * 77 + rgba[px + 1] * 150 + rgba[px + 2] * 29) >> 8;
+      diffSum += Math.abs(l - this.sceneSamples[i]);
+      this.sceneSamples[i] = l;
+    }
+    return diffSum / samples >= PeerSession.SCENE_CHANGE_THRESHOLD;
+  }
+
   sendAsciiFrame(charIndices: ArrayLike<number>, w: number, h: number, charset: string) {
     if (!this.dataConn?.open) return;
     if (!this.throttle()) return;
@@ -508,9 +551,11 @@ class PeerSession {
 
     this.frameCount++;
     const N = w * h;
-    let forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(2) || this.prevSentColorIdx?.length !== N || this.prevSentIndices?.length !== N;
+    let forceKeyframe = this.shouldForceKeyframe(this.sceneChanged(rgba, w, h)) || this.kindChanged(2) || this.prevSentColorIdx?.length !== N || this.prevSentIndices?.length !== N;
     const chars = this.scratchChars(charIndices, N);
+    const qt0 = performance.now();
     const q = this.quant.quantize(rgba, N, forceKeyframe, forceKeyframe ? null : this.prevSentColorIdx);
+    recordPerf(sizedBucket("quantize", w, h), performance.now() - qt0);
     if (q.rebuilt) forceKeyframe = true;
 
     const buf = encodeFrame({
@@ -524,8 +569,8 @@ class PeerSession {
     return { palette: q.palette, indices: q.indices };
   }
 
-  private shouldForceKeyframe(): boolean {
-    return this.needKeyframe || this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1;
+  private shouldForceKeyframe(sceneChange = false): boolean {
+    return this.needKeyframe || this.frameCount === 1 || this.frameCount % this.keyframeInterval === 1 || sceneChange;
   }
 
   sendColorFrame(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number, pixelated = false): { palette: Uint8Array; indices: Uint8Array } | null {
@@ -534,8 +579,10 @@ class PeerSession {
 
     this.frameCount++;
     const N = w * h;
-    let forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(pixelated ? 4 : 3) || this.prevSentColorIdx?.length !== N;
+    let forceKeyframe = this.shouldForceKeyframe(this.sceneChanged(rgba, w, h)) || this.kindChanged(pixelated ? 4 : 3) || this.prevSentColorIdx?.length !== N;
+    const qt0 = performance.now();
     const q = this.quant.quantize(rgba, N, forceKeyframe, forceKeyframe ? null : this.prevSentColorIdx);
+    recordPerf(sizedBucket("quantize", w, h), performance.now() - qt0);
     if (q.rebuilt) forceKeyframe = true;
 
     const buf = encodeFrame({
@@ -553,8 +600,10 @@ class PeerSession {
     if (!this.throttle()) return;
 
     this.frameCount++;
-    const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(pixel ? 6 : 5);
+    const forceKeyframe = this.shouldForceKeyframe(this.sceneChanged(rgba, w, h)) || this.kindChanged(pixel ? 6 : 5);
+    const qt0 = performance.now();
     const buf = this.adaptEnc.encode(rgba, w, h, Math.round(this.maxFrameSize * 0.8), forceKeyframe, { pixel });
+    recordPerf(sizedBucket("quadtree-encode", w, h), performance.now() - qt0);
     this.dispatch(buf, null, null, forceKeyframe);
   }
 
@@ -576,7 +625,7 @@ class PeerSession {
     if (!this.throttle()) return true;
 
     this.frameCount++;
-    const forceKey = this.needKeyframe || this.kindChanged(7) || this.frameCount === 1 || this.frameCount % 150 === 1;
+    const forceKey = this.needKeyframe || this.kindChanged(7) || this.frameCount === 1 || this.frameCount % 150 === 1 || this.sceneChanged(rgba, w, h);
     const tier = VIDEO_TIERS[this.qualityLevel];
     if (this.videoTx.encode(rgba, w, h, codec, tier.bitrate, this.targetFps, forceKey) && forceKey) this.needKeyframe = false;
     return true;
