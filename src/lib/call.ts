@@ -93,7 +93,7 @@ const MAX_RECONNECT_ATTEMPTS = 5;
  *  frame is quantized/encoded once per remote participant — see CallManager.broadcast below) stops being worth it. */
 export const MAX_REMOTE_PEERS = 3;
 
-export type CallQualityLevel = "low" | "medium" | "high" | "ultra" | "max";
+export type CallQualityLevel = "low" | "medium" | "high" | "ultra" | "max" | "extreme";
 
 export interface CallQualityStep {
   keyframeInterval: number;
@@ -111,15 +111,25 @@ export interface CallQualityStep {
 // keyframes). Scaling resolution down with quality keeps keyframes cheap too.
 // Frame rates are capped at what cameras actually deliver (≤30) — computing and sending 48-60 "frames"
 // per second only re-processed duplicate camera frames. The budget goes into grid resolution instead.
+// "extreme" only matters for the character/block-grid modes (ascii, color-ascii, pixel, color) -- real video (WebCodecs)
+// uses its own separate VIDEO_TIERS ladder entirely and is unaffected. resScale is deliberately kept at 1.0, same as
+// "max": the capture grid for ascii/color-ascii is already sized to the smallest LEGIBLE font (ASCII_MAX_CELLS/
+// COLOR_MAX_CELLS in CallTab.tsx, tuned to a 5px floor), so a bigger grid wouldn't add perceptible detail there, only
+// illegible glyphs -- the actual headroom a good connection can spend is fewer forced frame drops on busy/complex
+// scenes (maxFrameSize raised 50% over "max") and a crisper periodic refresh (shorter keyframeInterval). targetFps
+// stays at 30: cameras in this app don't deliver faster than that anyway (see the comment above), so there's nothing
+// to gain by raising it further. Reachable ONLY through the existing proven upgrade hysteresis (adaptQuality() below,
+// unchanged) -- 3 consecutive "healthy" checks -- so it never engages unless the connection is already genuinely good.
 const QUALITY_STEPS: Record<CallQualityLevel, CallQualityStep> = {
-  low:    { keyframeInterval: 60, targetFps: 10, maxFrameSize: 6000,  resScale: 0.5  },
-  medium: { keyframeInterval: 60, targetFps: 15, maxFrameSize: 12000, resScale: 0.7  },
-  high:   { keyframeInterval: 60, targetFps: 20, maxFrameSize: 24000, resScale: 0.85 },
-  ultra:  { keyframeInterval: 60, targetFps: 24, maxFrameSize: 40000, resScale: 1.0  },
-  max:    { keyframeInterval: 60, targetFps: 30, maxFrameSize: 60000, resScale: 1.0  },
+  low:     { keyframeInterval: 60, targetFps: 10, maxFrameSize: 6000,  resScale: 0.5  },
+  medium:  { keyframeInterval: 60, targetFps: 15, maxFrameSize: 12000, resScale: 0.7  },
+  high:    { keyframeInterval: 60, targetFps: 20, maxFrameSize: 24000, resScale: 0.85 },
+  ultra:   { keyframeInterval: 60, targetFps: 24, maxFrameSize: 40000, resScale: 1.0  },
+  max:     { keyframeInterval: 60, targetFps: 30, maxFrameSize: 60000, resScale: 1.0  },
+  extreme: { keyframeInterval: 45, targetFps: 30, maxFrameSize: 90000, resScale: 1.0  },
 };
 
-const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra", "max"];
+const QUALITY_ORDER: CallQualityLevel[] = ["low", "medium", "high", "ultra", "max", "extreme"];
 
 const BUFFERED_AMOUNT_LOW_THRESHOLD = 96 * 1024;
 const BUFFERED_AMOUNT_CRITICAL = 1024 * 1024;
