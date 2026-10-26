@@ -50,14 +50,19 @@ const cvMap  = new WeakMap<HTMLPreElement, HTMLCanvasElement>();
 const imgMap = new WeakMap<HTMLCanvasElement, ImageData>();
 const TILE_FIT = "cover";
 
-// Receive-side enhance circuit breaker, video-codec frames only (paintCanvas's HTMLCanvasElement branch below). On-device
-// measurement (docs/priority3-pipeline-audit.md's "fixed" version) showed the decode-readback getImageData() call itself
-// staying expensive (~24ms median, 100ms+ p95 at a modest 112x144) regardless of whether the source canvas is displayed —
-// i.e. the original hypothesis (displayed-canvas GPU sync cost) wasn't the dominant factor; readback is just costly on
-// some devices/drivers, full stop. Rather than guess at a universal fix, this makes the cost self-limiting per tile: once
-// the EMA of readback time crosses ENHANCE_BUDGET_MS we stop paying it most frames (plain drawImage, no CPU readback at
-// all) and only re-probe occasionally, so a slow device degrades to "picture without sharpening" instead of staying
-// consistently over frame budget. Same EMA/hysteresis idiom as governor.ts/denoise.ts.
+// Receive-side enhance circuit breaker, shared by BOTH of paintCanvas's branches below: the video-codec path (gated on
+// decode-readback getImageData() cost, since that's the unavoidable expensive step there) and the quadtree/adaptive
+// Color-Pixel path (gated on enhance() itself, since those frames arrive as a plain ImageData with no readback needed).
+// On-device measurement (docs/priority3-pipeline-audit.md's "fixed" version) showed the video-codec readback staying
+// expensive (~24ms median, 100ms+ p95 at a modest 112x144) regardless of whether the source canvas is displayed — i.e.
+// the original hypothesis (displayed-canvas GPU sync cost) wasn't the dominant factor; readback is just costly on some
+// devices/drivers, full stop. The quadtree path has no readback step, but a weak receiving device can still find
+// enhance()'s own per-frame cost (a full-frame luminance pass plus sharpen/adaptive-contrast) too expensive — same
+// symptom (receive-side stutter despite a smoothly-sending peer, whose cost is the much cheaper quantize+encode step),
+// different cost center. Rather than guess at a universal fix, both branches make their respective cost self-limiting
+// per tile: once the EMA crosses ENHANCE_BUDGET_MS we stop paying it most frames (plain draw, no extra CPU work) and
+// only re-probe occasionally, so a slow device degrades to "picture without sharpening" instead of staying consistently
+// over frame budget. Same EMA/hysteresis idiom as governor.ts/denoise.ts.
 // Keyed by frame SIZE too (not just tile), not only the tile: the adaptive-quality logic changes a peer's video
 // dimensions fairly often (congestion, tier ramp-up at call start), and a brief run of frames at a transiently larger
 // size would otherwise push one shared EMA over budget, disabling enhancement for the *next* ~30-frame probe window even
@@ -173,11 +178,30 @@ function paintCanvas(pre: HTMLPreElement, area: HTMLElement | null, img: ImageDa
     if (out) cctx.putImageData(out, 0, 0);
     else cctx.drawImage(img, 0, 0); // no enhancement to apply (over budget, or couldn't get a context) — a plain draw, no readback at all
   } else {
+    // Quadtree/adaptive Color-Pixel frames arrive as a plain ImageData, so there's no GPU readback to gate on here (the
+    // way the HTMLCanvasElement branch above does) -- the cost that actually matters on a weaker device is enhance()
+    // itself (a full-frame luminance pass plus sharpen/adaptive-contrast, all JS). Previously this ran unconditionally
+    // every frame with no budget check at all, unlike the video-codec path, which meant a receiving device with a weak
+    // CPU had no fallback and could stutter on every frame even though the SENDING device (whose cost is the much
+    // cheaper quantize+encode step) stayed smooth -- same symptom as the video-codec case this breaker was built for,
+    // just a different cost center. Same per-(tile,size) EMA/probe gate, now measuring enhance()'s own time directly.
     let out: ImageData | null = null;
     if (!pixelated && enhanceFrame) {
-      const t0 = performance.now();
-      out = enhance(img.data, w, h);
-      recordPerf(sizedBucket("receive-enhance", w, h), performance.now() - t0);
+      let sizeGates = enhanceGates.get(pre);
+      if (!sizeGates) { sizeGates = new Map(); enhanceGates.set(pre, sizeGates); }
+      const sizeKey = `${w}x${h}`;
+      let gate = sizeGates.get(sizeKey);
+      if (!gate) { gate = { emaMs: 0, probeCounter: 0 }; sizeGates.set(sizeKey, gate); }
+      const underBudget = gate.emaMs <= ENHANCE_BUDGET_MS;
+      let probe = underBudget;
+      if (!probe) { gate.probeCounter++; if (gate.probeCounter >= ENHANCE_PROBE_EVERY) { gate.probeCounter = 0; probe = true; } }
+      if (probe) {
+        const t0 = performance.now();
+        out = enhance(img.data, w, h);
+        const ms = performance.now() - t0;
+        recordPerf(sizedBucket("receive-enhance", w, h), ms);
+        gate.emaMs += (ms - gate.emaMs) * ENHANCE_ALPHA;
+      }
     }
     cctx.putImageData(out ?? img, 0, 0);
   }
