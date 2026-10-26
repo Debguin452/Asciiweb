@@ -64,13 +64,18 @@ export async function probeDecoders(): Promise<VideoCodecId[]> {
   return out;
 }
 
-/** Capture size and bitrate for a quality tier: long side in px (multiple of 16), bits per second. */
+/** Capture size and bitrate for a quality tier: long side in px (multiple of 16), bits per second.
+ *  "extreme" (call.ts's CallQualityLevel) is a non-video-codec tier added for the ascii/color-ascii/pixel/color
+ *  character-grid modes only -- real video is slated to move to a separate app later and isn't the target of that
+ *  work, so this entry just mirrors "max" to keep VIDEO_TIERS[level] a valid lookup for every CallQualityLevel
+ *  without changing video behavior at all. */
 export const VIDEO_TIERS = {
-  low:    { long: 192, bitrate:  70_000 },
-  medium: { long: 256, bitrate: 140_000 },
-  high:   { long: 320, bitrate: 260_000 },
-  ultra:  { long: 384, bitrate: 420_000 },
-  max:    { long: 448, bitrate: 650_000 },
+  low:     { long: 192, bitrate:  70_000 },
+  medium:  { long: 256, bitrate: 140_000 },
+  high:    { long: 320, bitrate: 260_000 },
+  ultra:   { long: 384, bitrate: 420_000 },
+  max:     { long: 448, bitrate: 650_000 },
+  extreme: { long: 448, bitrate: 650_000 },
 } as const;
 
 /** Both sides multiples of 16 (hardware encoders pad anything else), aspect kept. */

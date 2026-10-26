@@ -542,6 +542,7 @@ class PeerSession {
     const forceKeyframe = this.shouldForceKeyframe() || this.kindChanged(1);
     const chars = this.scratchChars(charIndices, N);
 
+    const et0 = performance.now();
     const buf = encodeFrame({
       w, h, charset, colorIndices: null, palette: null, sendPalette: false,
       charIndices: chars, blockColorMode: false,
@@ -549,6 +550,7 @@ class PeerSession {
       prevColorIndices: null,
       forceKeyframe,
     });
+    recordPerf(sizedBucket("ascii-encode", w, h), performance.now() - et0);
     this.dispatch(buf, chars, null, forceKeyframe);
   }
 
@@ -568,6 +570,7 @@ class PeerSession {
     recordPerf(sizedBucket("quantize", w, h), performance.now() - qt0);
     if (q.rebuilt) forceKeyframe = true;
 
+    const et0 = performance.now();
     const buf = encodeFrame({
       w, h, charset, colorIndices: q.indices, palette: q.palette, sendPalette: forceKeyframe,
       charIndices: chars, blockColorMode: false,
@@ -575,6 +578,7 @@ class PeerSession {
       prevColorIndices: forceKeyframe ? null : this.prevSentColorIdx,
       forceKeyframe,
     });
+    recordPerf(sizedBucket("ascii-color-encode", w, h), performance.now() - et0);
     this.dispatch(buf, chars, q.indices, forceKeyframe);
     return { palette: q.palette, indices: q.indices };
   }
@@ -595,12 +599,14 @@ class PeerSession {
     recordPerf(sizedBucket("quantize", w, h), performance.now() - qt0);
     if (q.rebuilt) forceKeyframe = true;
 
+    const et0 = performance.now();
     const buf = encodeFrame({
       w, h, charset: "", colorIndices: q.indices, palette: q.palette, sendPalette: forceKeyframe,
       charIndices: null, blockColorMode: true, pixelated,
       prevCharIndices: null, prevColorIndices: forceKeyframe ? null : this.prevSentColorIdx,
       forceKeyframe,
     });
+    recordPerf(sizedBucket(pixelated ? "pixel-encode" : "color-encode", w, h), performance.now() - et0);
     this.dispatch(buf, null, q.indices, forceKeyframe);
     return { palette: q.palette, indices: q.indices };
   }
