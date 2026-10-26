@@ -22,6 +22,11 @@ export interface RemoteFrame {
 // fighting the inference at every call site.
 type Bytes = Uint8Array<ArrayBufferLike>;
 
+// Both stateless and safe to reuse across every call -- encodeFrame()/decode() run once per outgoing/incoming frame
+// (every frame for ASCII/Color-ASCII), so constructing a fresh instance each time was a pointless per-frame allocation.
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 const FLAG_KEYFRAME    = 0x01;
 const FLAG_DELTA       = 0x02;
 const FLAG_BLOCK_COLOR = 0x04;
@@ -328,7 +333,7 @@ export function encodeFrame(opts: EncodeOpts): ArrayBuffer {
   const { w, h, charset, colorIndices, palette, blockColorMode, prevCharIndices, prevColorIndices, forceKeyframe } = opts;
   const charIndices = opts.charIndices;
   const N = w * h;
-  const charsetBytes = blockColorMode ? new Uint8Array(0) : new TextEncoder().encode(charset);
+  const charsetBytes = blockColorMode ? new Uint8Array(0) : textEncoder.encode(charset);
   const bitsPerChar = blockColorMode ? 0 : bitsNeeded(charset.length);
 
   let charDelta: Bytes | null = null;
@@ -402,7 +407,7 @@ export function decode(buffer: ArrayBuffer, prevFrame: RemoteFrame | null): Remo
 
   const charsetLen = data[p++];
   if (p + charsetLen > data.length) return null;
-  const charset = isBlockColor ? "" : new TextDecoder().decode(data.subarray(p, p + charsetLen));
+  const charset = isBlockColor ? "" : textDecoder.decode(data.subarray(p, p + charsetLen));
   p += charsetLen;
 
   const baseOk = !!prevFrame && prevFrame.w === w && prevFrame.h === h;
@@ -427,7 +432,7 @@ export function decode(buffer: ArrayBuffer, prevFrame: RemoteFrame | null): Remo
     const paletteLen = (data[p] << 8) | data[p + 1];
     p += 2;
     if (paletteLen === 0 || p + paletteLen > data.length) return null;
-    palette = new Uint8Array(data.slice(p, p + paletteLen));
+    palette = data.slice(p, p + paletteLen); // .slice() already returns an independent copy -- wrapping it in `new Uint8Array(...)` copied it twice
     p += paletteLen;
   } else if ((isBlockColor || hasAsciiColor) && prevFrame?.palette) {
     palette = prevFrame.palette;
