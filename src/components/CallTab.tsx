@@ -1008,7 +1008,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
 
     const isMirror = facingRef.current === "user";
 
-    const base  = callMode === "color" ? remoteFitColorRef.current : remoteFitRef.current; // Pixel uses the character grid, like ASCII
+    // Drives `pip` below, which only ascii/color-ascii actually read (as asciiW/asciiH) -- Color and Pixel compute their
+    // own capture size independently further down and never reference `pip`/`base` at all, so this split is really just
+    // "ascii/color-ascii's character grid" vs "unused by the other two", not a Pixel-specific choice.
+    const base  = callMode === "color" ? remoteFitColorRef.current : remoteFitRef.current;
     const scale = qualityScaleRef.current * gov.scaleMul;
     const cols  = Math.max(14, Math.round(base.cols * scale));
     const rows  = Math.max(8,  Math.round(base.rows * scale));
@@ -1042,8 +1045,13 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
         produced = true;
       }
     } else if (callMode === "pixel") {
-      // Pixel art rides the same adaptive true-color codec as Color mode, just on a coarse grid shown with hard cell edges.
-      const long = Math.max(40, Math.min(96, Math.round(96 * scale / 8) * 8));
+      // Pixel art rides the same adaptive true-color codec as Color mode, shown with hard cell edges instead of smooth
+      // scaling. The grid ceiling used to be hardcoded to half of Color mode's (96px long side vs Color's 192px) --
+      // unrelated to the ASCII_MAX_CELLS/COLOR_MAX_CELLS split below (which governs ascii/color-ascii/color's *character*
+      // grid, not this), it was just its own separate cap, presumably once set for a deliberately chunky look. Raised to
+      // match Color's ceiling on request: a good connection can now give Pixel mode the same resolution headroom Color
+      // gets, same as every other mode this session.
+      const long = Math.max(40, Math.min(192, Math.round(192 * scale / 8) * 8));
       const d = adaptiveDims(video.videoWidth, video.videoHeight, long);
       const img = video.videoWidth ? sampleColorFrame(video, colorCanvas.current, d.w, d.h, isMirror) : null;
       if (img) {
