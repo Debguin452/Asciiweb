@@ -171,3 +171,60 @@ function run(src: Uint8ClampedArray, w: number, h: number): ImageData {
   }
   return img;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sender-side pre-quantization edge preservation (Priority 3 roadmap item 2/14). Researched against current technique
+// (arXiv 2510.22551, "Structure Aware Image Downscaling", Oct 2025): that paper's full approach runs Sobel edge
+// detection at the camera's FULL capture resolution, before any downscale -- which doesn't fit here. This app's capture
+// pipeline deliberately downsamples via the browser's own GPU-accelerated canvas drawImage BEFORE any pixel ever gets
+// read back to the CPU (see CallTab.tsx's sampleColorFrame), and that's exactly the design choice this whole session's
+// work has protected -- adding a full-resolution CPU edge-detection pass ahead of it would reintroduce the same kind of
+// expensive readback already fixed elsewhere in this codebase. So this is a deliberately cheaper adaptation: edge
+// detection runs on the ALREADY-DOWNSAMPLED frame (the same small grid ColorQuantizer.quantize() is about to receive),
+// which is the one piece of the paper's idea that transfers cheaply to a budget this size has already proven safe for
+// (same resolution class as quantize/encode, measured sub-5ms all session).
+//
+// Distinct from enhance() above on purpose, not a reuse of it: enhance() runs on the RECEIVING device, post-decode,
+// tuned to look good to a human eye (contrast/saturation/LUT included). This runs on the SENDING device, pre-
+// quantization, with one narrow job -- stop a genuine high-contrast edge from being smoothed into a single quantized
+// color bucket before it's even sent -- not to sharpen the picture generally, since the receiver likely already will.
+// Deliberately much weaker than enhance()'s SHARPEN (0.85): if both ends ran full-strength, the final picture would be
+// visibly over-sharpened even though neither device did anything wrong on its own. Uses the same noise-gated unsharp-
+// mask core already validated in enhance() above (same 3x3 blur kernel, same quadratic noise falloff), not a new,
+// unproven algorithm -- only the strength/floor/halo constants and the lack of contrast/saturation processing differ.
+const PRESHARPEN_STRENGTH = 0.35;
+const PRESHARPEN_NOISE_FLOOR = 6; // higher than enhance()'s 4: this runs on capture-fresh data that may not have been denoised yet in every call path
+const PRESHARPEN_HALO_LIMIT = 18;
+
+let preLuma = new Uint8ClampedArray(0);
+
+/** Mutates `rgba` in place. Call once per captured frame, before ColorQuantizer.quantize() -- NOT once per outgoing
+ *  peer in a multi-peer broadcast, since this is an in-place edit and running it per-peer on a shared buffer would
+ *  compound the sharpen with every additional participant. */
+export function presharpenForQuantization(rgba: Uint8ClampedArray | Uint8Array, w: number, h: number) {
+  const n = w * h;
+  if (n === 0 || w < 3 || h < 3) return; // too small for a 3x3 neighborhood
+  if (preLuma.length !== n) preLuma = new Uint8ClampedArray(n);
+  for (let i = 0, p = 0; i < n; i++, p += 4) preLuma[i] = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
+
+  for (let y = 1; y < h - 1; y++) {
+    const rowBase = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = rowBase + x, p = i * 4;
+      const a = i - w, b = i + w;
+      const blur = (preLuma[a - 1] + 2 * preLuma[a] + preLuma[a + 1] + 2 * preLuma[i - 1] + 4 * preLuma[i] + 2 * preLuma[i + 1] + preLuma[b - 1] + 2 * preLuma[b] + preLuma[b + 1]) >> 4;
+      const diff = preLuma[i] - blur;
+      const ad = diff < 0 ? -diff : diff;
+      const gate = ad >= PRESHARPEN_NOISE_FLOOR ? 1 : (ad * ad) / (PRESHARPEN_NOISE_FLOOR * PRESHARPEN_NOISE_FLOOR);
+      let d = diff * PRESHARPEN_STRENGTH * gate;
+      d = d > PRESHARPEN_HALO_LIMIT ? PRESHARPEN_HALO_LIMIT : d < -PRESHARPEN_HALO_LIMIT ? -PRESHARPEN_HALO_LIMIT : d;
+      if (d !== 0) {
+        rgba[p]     = clamp8(rgba[p] + d);
+        rgba[p + 1] = clamp8(rgba[p + 1] + d);
+        rgba[p + 2] = clamp8(rgba[p + 2] + d);
+      }
+    }
+  }
+}
+
+function clamp8(v: number): number { return v < 0 ? 0 : v > 255 ? 255 : v; }
