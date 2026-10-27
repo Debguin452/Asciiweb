@@ -1174,7 +1174,10 @@ export default function CallTab({ opts, updateOpt, inviteCode = "", onInviteCons
               !s.remoteDecoders || s.remoteDecoders.length === 0 ? " (remote hasn't reported decode support yet, or can't decode any)" :
               s.localEncoders.some(c => s.remoteDecoders!.includes(c)) ? " (shared codec exists but is disabled/errored)" :
               ` (no overlap: we encode [${s.localEncoders.map(c => VIDEO_CODEC_NAME[c]).join(",")}], they decode [${s.remoteDecoders.map(c => VIDEO_CODEC_NAME[c]).join(",")}])`;
-            return `${id.slice(0, 6)}:${neg}${why}`;
+            // "relay" means a free TURN server's bandwidth is the ceiling for this peer, not the phone's real network
+            // (see call.ts's PeerSession.pollConnectionType) -- the question of whether 21-60 KB/s is a network limit
+            // or a TURN-relay limit hinges on this.
+            return `${id.slice(0, 6)}:${neg}${why}:${s.connectionType}`;
           }).join(" ")
         : "";
       logPerfSummary(`mode=${callModeRef.current} tiles=${participants.length} codecs=[${codecStr}]`);
