@@ -204,6 +204,10 @@ class PeerSession {
   private rtt = 0;
   private rttBase = 0;
   private rttSamples: number[] = [];
+  // Diagnostic only, never used to make a decision -- see pollConnectionType() below. "relay" means at least one side
+  // is going through a TURN server rather than a direct peer-to-peer path, which puts that TURN server's own bandwidth
+  // (not the phone's real network capacity) in the critical path for the whole call.
+  private connectionType: "direct" | "relay" | "unknown" = "unknown";
   private consecutiveDrops = 0;
   private frameCount = 0;
   private keyframeInterval = QUALITY_STEPS.medium.keyframeInterval;
@@ -293,6 +297,29 @@ class PeerSession {
     this.rttBase = Math.min(...this.rttSamples);
   }
 
+  // Diagnostic for the question "is a free TURN relay the actual bandwidth ceiling, not the phone's real network?" --
+  // read-only, never affects behavior. Uses the browser's real WebRTC getStats() (distinct from this class's own
+  // getStats() above, which only reports app-level numbers already being tracked) to find the ICE candidate pair
+  // actually in use and check whether either side is a TURN relay candidate. If either local or remote is "relay",
+  // that TURN server's own throughput is in the critical path for the whole call, not just the phone's radio link.
+  private async pollConnectionType(conn: DataConnection) {
+    try {
+      const report = await conn.peerConnection.getStats();
+      let pair: RTCIceCandidatePairStats | null = null;
+      report.forEach((s) => {
+        if (s.type === "candidate-pair" && (s as RTCIceCandidatePairStats).state === "succeeded") pair = s as RTCIceCandidatePairStats;
+      });
+      if (!pair) return;
+      // TS's bundled DOM lib has no type for a local/remote-candidate stats report (only the pair type above), despite
+      // it being a real part of the spec every browser returns -- a known gap, not a mistake here.
+      type CandidateStats = { candidateType?: string };
+      const local = report.get((pair as RTCIceCandidatePairStats).localCandidateId) as CandidateStats | undefined;
+      const remote = report.get((pair as RTCIceCandidatePairStats).remoteCandidateId) as CandidateStats | undefined;
+      const isRelay = local?.candidateType === "relay" || remote?.candidateType === "relay";
+      this.connectionType = isRelay ? "relay" : "direct";
+    } catch { /* getStats() can fail transiently mid-negotiation -- leave connectionType as "unknown", harmless */ }
+  }
+
   private requestKeyframe() {
     const now = performance.now();
     if (now - this.lastKfRequestAt < 400 || !this.dataConn?.open) return;
@@ -367,6 +394,10 @@ class PeerSession {
       probeDecoders().then(dec => { try { conn.send({ type: "caps", dec }); } catch { /* noop */ } }).catch(() => {});
       this.lastRecvAt = performance.now();
       this.startHeartbeat();
+      // Delayed so ICE has time to actually nominate a candidate pair -- querying immediately on "open" can catch it
+      // mid-negotiation. A single poll is enough: the nominated pair essentially never changes mid-call outside a full
+      // ICE restart (reconnect), which re-attaches a fresh `conn` and re-triggers this anyway.
+      setTimeout(() => { if (this.dataConn === conn) this.pollConnectionType(conn); }, 2000);
     });
 
     conn.on("data", (data: unknown) => {
@@ -746,6 +777,9 @@ class PeerSession {
       // us it can decode (received once over the data channel as a "caps" message, see attachData()).
       localEncoders: this.encCodecs,
       remoteDecoders: this.remoteDec,
+      // "relay" means a free TURN server's own bandwidth is the ceiling for this peer, not the phone's real network --
+      // see pollConnectionType() above. "unknown" until ~2s after connecting.
+      connectionType: this.connectionType,
     };
   }
   get isConnected() { return !!this.dataConn?.open; }
